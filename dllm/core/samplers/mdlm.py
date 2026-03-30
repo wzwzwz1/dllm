@@ -10,7 +10,12 @@ import torch
 import torch.nn.functional as F
 
 from dllm.core.samplers.base import BaseSampler, BaseSamplerConfig, BaseSamplerOutput
-from dllm.core.samplers.utils import add_gumbel_noise, get_num_transfer_tokens
+from dllm.core.samplers.utils import (
+    add_gumbel_noise,
+    get_num_transfer_tokens,
+    get_token_entropy,
+    select_transfer_positions,
+)
 
 
 @dataclass
@@ -29,6 +34,9 @@ class MDLMSamplerConfig(BaseSamplerConfig):
     suppress_tokens: list[int] | None = None
     begin_suppress_tokens: list[int] | None = None
     right_shift_logits: bool = False
+    entropy_min_tokens_per_step: int = 0
+    entropy_early_ratio: float = 0.3
+    entropy_top_k: int | None = None
 
 
 @dataclass
@@ -75,6 +83,13 @@ class MDLMSampler(BaseSampler):
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
+        entropy_min_tokens_per_step = kwargs.get(
+            "entropy_min_tokens_per_step", config.entropy_min_tokens_per_step
+        )
+        entropy_early_ratio = kwargs.get(
+            "entropy_early_ratio", config.entropy_early_ratio
+        )
+        entropy_top_k = kwargs.get("entropy_top_k", config.entropy_top_k)
 
         assert 1 <= block_size
         assert 1 <= steps
@@ -156,6 +171,11 @@ class MDLMSampler(BaseSampler):
 
             # Some steps may be skipped if there are no transfers
             effective_steps = num_transfer_tokens.size(1)
+            entropy_guided_steps = (
+                math.ceil(effective_steps * entropy_early_ratio)
+                if entropy_min_tokens_per_step > 0
+                else 0
+            )
 
             # ----- Iterative reveal inside the current block -----
             for i in range(effective_steps):
@@ -207,24 +227,28 @@ class MDLMSampler(BaseSampler):
                     raise NotImplementedError(remasking)
 
                 # Restrict selection window to the *current block's* tail region
+                candidate_mask = mask_index.clone()
                 for j in range(B):
-                    x0_p[j, prompt_lens[j] + (b + 1) * block_size :] = -np.inf
+                    block_start = prompt_lens[j] + b * block_size
+                    block_end = prompt_lens[j] + (b + 1) * block_size
+                    candidate_mask[j, :block_start] = False
+                    candidate_mask[j, block_end:] = False
 
                 # Only allow updates at currently masked positions; keep others fixed
                 x0 = torch.where(mask_index, x0, x)
-                confidence = torch.where(
-                    mask_index, x0_p, -np.inf
-                )  # consider masked positions only
+                confidence = torch.where(candidate_mask, x0_p, -np.inf)
 
-                # Pick exactly `num_transfer_tokens[j, i]` highest-confidence positions per sample
-                transfer_index = torch.zeros_like(
-                    x0, dtype=torch.bool, device=x0.device
+                entropy_scores = None
+                if i < entropy_guided_steps:
+                    entropy_scores = get_token_entropy(logits, top_k=entropy_top_k)
+
+                transfer_index = select_transfer_positions(
+                    confidence=confidence,
+                    mask_index=candidate_mask,
+                    target_counts=num_transfer_tokens[:, i],
+                    entropy_scores=entropy_scores,
+                    entropy_first_k=entropy_min_tokens_per_step,
                 )
-                for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(
-                        confidence[j], k=num_transfer_tokens[j, i]
-                    )
-                    transfer_index[j, select_index] = True
 
                 # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
@@ -269,6 +293,13 @@ class MDLMSampler(BaseSampler):
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
+        entropy_min_tokens_per_step = kwargs.get(
+            "entropy_min_tokens_per_step", config.entropy_min_tokens_per_step
+        )
+        entropy_early_ratio = kwargs.get(
+            "entropy_early_ratio", config.entropy_early_ratio
+        )
+        entropy_top_k = kwargs.get("entropy_top_k", config.entropy_top_k)
 
         mask_id = self.tokenizer.mask_token_id
         bos_id = self.tokenizer.bos_token_id
@@ -348,6 +379,11 @@ class MDLMSampler(BaseSampler):
 
             # Some blocks may have no masks => effective_steps == 0
             effective_steps = num_transfer_tokens.size(1)
+            entropy_guided_steps = (
+                math.ceil(effective_steps * entropy_early_ratio)
+                if entropy_min_tokens_per_step > 0
+                else 0
+            )
 
             for s in range(effective_steps):
                 mask_index_full = x == mask_id
@@ -394,23 +430,27 @@ class MDLMSampler(BaseSampler):
                     raise NotImplementedError(remasking)
 
                 # Restrict selection to the *current* block only
+                candidate_mask = mask_index_full.clone()
                 for j in range(B):
                     end_j = start + widths[j]
-                    # Outside current block => impossible to select
-                    x0_p[j, :start] = -np.inf
-                    x0_p[j, end_j:] = -np.inf
+                    candidate_mask[j, :start] = False
+                    candidate_mask[j, end_j:] = False
 
                 # Only consider currently-masked positions as candidates
                 x0 = torch.where(mask_index_full, x0, x)
-                confidence = torch.where(mask_index_full, x0_p, -np.inf)
+                confidence = torch.where(candidate_mask, x0_p, -np.inf)
 
-                # Pick exactly num_transfer_tokens[j, s] positions per sample
-                transfer_index = torch.zeros_like(x, dtype=torch.bool)
-                for j in range(B):
-                    k = int(num_transfer_tokens[j, s].item())
-                    if k > 0:
-                        _, select_idx = torch.topk(confidence[j], k=k)
-                        transfer_index[j, select_idx] = True
+                entropy_scores = None
+                if s < entropy_guided_steps:
+                    entropy_scores = get_token_entropy(logits, top_k=entropy_top_k)
+
+                transfer_index = select_transfer_positions(
+                    confidence=confidence,
+                    mask_index=candidate_mask,
+                    target_counts=num_transfer_tokens[:, s],
+                    entropy_scores=entropy_scores,
+                    entropy_first_k=entropy_min_tokens_per_step,
+                )
 
                 # Commit selected predictions into the canvas
                 x[transfer_index] = x0[transfer_index]

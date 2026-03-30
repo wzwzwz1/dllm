@@ -10,7 +10,12 @@ import torch
 import torch.nn.functional as F
 
 from dllm.core.samplers.base import BaseSampler, BaseSamplerConfig, BaseSamplerOutput
-from dllm.core.samplers.utils import add_gumbel_noise, get_num_transfer_tokens
+from dllm.core.samplers.utils import (
+    add_gumbel_noise,
+    get_num_transfer_tokens,
+    get_token_entropy,
+    select_transfer_positions,
+)
 
 
 def _trim_past_key_values(
@@ -38,6 +43,8 @@ def _get_transfer_index(
     num_transfer_tokens: Optional[torch.Tensor] = None,  # (B,) long (top-k mode)
     threshold: Optional[float] = None,  # threshold mode
     factor: Optional[float] = None,  # dynamic mode (highest priority)
+    entropy_first_k: int = 0,
+    entropy_top_k: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Returns:
@@ -73,6 +80,10 @@ def _get_transfer_index(
         mask_index, conf, torch.tensor(neg, device=conf.device, dtype=conf.dtype)
     )  # (B, L)
 
+    entropy_scores = None
+    if entropy_first_k > 0:
+        entropy_scores = get_token_entropy(logits, top_k=entropy_top_k)
+
     # --------------------------
     # A) Dynamic factor schedule
     # --------------------------
@@ -103,6 +114,15 @@ def _get_transfer_index(
         transfer_int = torch.zeros(B, L, device=confidence.device, dtype=torch.int8)
         transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
         transfer_index = transfer_int.bool() & mask_index
+        if entropy_scores is not None:
+            counts = transfer_index.sum(dim=1)
+            transfer_index = select_transfer_positions(
+                confidence=confidence,
+                mask_index=mask_index,
+                target_counts=counts,
+                entropy_scores=entropy_scores,
+                entropy_first_k=entropy_first_k,
+            )
         return x0, transfer_index
 
     # --------------------------
@@ -122,6 +142,16 @@ def _get_transfer_index(
             force = torch.zeros_like(transfer_index).scatter_(1, max_idx, True)
             transfer_index = (transfer_index | force) & mask_index
 
+        if entropy_scores is not None:
+            counts = transfer_index.sum(dim=1)
+            transfer_index = select_transfer_positions(
+                confidence=confidence,
+                mask_index=mask_index,
+                target_counts=counts,
+                entropy_scores=entropy_scores,
+                entropy_first_k=entropy_first_k,
+            )
+
         return x0, transfer_index
 
     # --------------------------
@@ -140,15 +170,24 @@ def _get_transfer_index(
     )
     num_transfer_tokens = torch.clamp(num_transfer_tokens, min=0)
 
-    values, idx = torch.sort(confidence, dim=1, descending=True)  # (B, L)
-    B, L = confidence.shape
+    if entropy_scores is not None:
+        transfer_index = select_transfer_positions(
+            confidence=confidence,
+            mask_index=mask_index,
+            target_counts=num_transfer_tokens,
+            entropy_scores=entropy_scores,
+            entropy_first_k=entropy_first_k,
+        )
+    else:
+        values, idx = torch.sort(confidence, dim=1, descending=True)  # (B, L)
+        B, L = confidence.shape
 
-    cols = torch.arange(L, device=confidence.device).unsqueeze(0).expand(B, L)
-    select_sorted = cols < num_transfer_tokens.unsqueeze(1)  # (B, L)
+        cols = torch.arange(L, device=confidence.device).unsqueeze(0).expand(B, L)
+        select_sorted = cols < num_transfer_tokens.unsqueeze(1)  # (B, L)
 
-    transfer_int = torch.zeros(B, L, device=confidence.device, dtype=torch.int8)
-    transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
-    transfer_index = transfer_int.bool() & mask_index
+        transfer_int = torch.zeros(B, L, device=confidence.device, dtype=torch.int8)
+        transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
+        transfer_index = transfer_int.bool() & mask_index
 
     return x0, transfer_index
 
@@ -174,6 +213,9 @@ class FastdLLMLLaDASamplerConfig(BaseSamplerConfig):
     # Remasking knobs (match NVLabs generate.py behavior)
     threshold: float | None = None
     factor: float | None = None
+    entropy_min_tokens_per_step: int = 0
+    entropy_early_ratio: float = 0.3
+    entropy_top_k: int | None = None
 
 
 @dataclass
@@ -215,6 +257,13 @@ class FastdLLMLLaDASampler(BaseSampler):
         use_cache = kwargs.get("use_cache", config.use_cache)
         threshold = kwargs.get("threshold", config.threshold)
         factor = kwargs.get("factor", config.factor)
+        entropy_min_tokens_per_step = kwargs.get(
+            "entropy_min_tokens_per_step", config.entropy_min_tokens_per_step
+        )
+        entropy_early_ratio = kwargs.get(
+            "entropy_early_ratio", config.entropy_early_ratio
+        )
+        entropy_top_k = kwargs.get("entropy_top_k", config.entropy_top_k)
 
         assert block_size >= 1
         assert steps >= 1
@@ -366,6 +415,11 @@ class FastdLLMLLaDASampler(BaseSampler):
                 stochastic=stochastic_transfer,
             )
             effective_steps = num_transfer_tokens.size(1)
+            entropy_guided_steps = (
+                math.ceil(steps_per_block * entropy_early_ratio)
+                if entropy_min_tokens_per_step > 0
+                else 0
+            )
 
             # -------------------------
             # Mode 1: No cache
@@ -404,6 +458,12 @@ class FastdLLMLLaDASampler(BaseSampler):
                         num_transfer_tokens=quota,
                         threshold=threshold,
                         factor=factor,
+                        entropy_first_k=(
+                            entropy_min_tokens_per_step
+                            if i < entropy_guided_steps
+                            else 0
+                        ),
+                        entropy_top_k=entropy_top_k,
                     )
 
                     x = torch.where(transfer_idx, x0, x)
@@ -444,6 +504,12 @@ class FastdLLMLLaDASampler(BaseSampler):
                         num_transfer_tokens=quota,
                         threshold=threshold,
                         factor=factor,
+                        entropy_first_k=(
+                            entropy_min_tokens_per_step
+                            if 0 < entropy_guided_steps
+                            else 0
+                        ),
+                        entropy_top_k=entropy_top_k,
                     )
 
                     x = torch.where(transfer_idx, x0, x)
@@ -500,6 +566,12 @@ class FastdLLMLLaDASampler(BaseSampler):
                         num_transfer_tokens=quota,
                         threshold=threshold,
                         factor=factor,
+                        entropy_first_k=(
+                            entropy_min_tokens_per_step
+                            if i < entropy_guided_steps
+                            else 0
+                        ),
+                        entropy_top_k=entropy_top_k,
                     )
 
                     x_suffix_new = torch.where(transfer_suf, x0_suf, x_suffix)
@@ -549,6 +621,12 @@ class FastdLLMLLaDASampler(BaseSampler):
                         num_transfer_tokens=quota,
                         threshold=threshold,
                         factor=factor,
+                        entropy_first_k=(
+                            entropy_min_tokens_per_step
+                            if 0 < entropy_guided_steps
+                            else 0
+                        ),
+                        entropy_top_k=entropy_top_k,
                     )
 
                     x = torch.where(transfer_idx, x0, x)
@@ -592,6 +670,12 @@ class FastdLLMLLaDASampler(BaseSampler):
                         num_transfer_tokens=quota,
                         threshold=threshold,
                         factor=factor,
+                        entropy_first_k=(
+                            entropy_min_tokens_per_step
+                            if i_step < entropy_guided_steps
+                            else 0
+                        ),
+                        entropy_top_k=entropy_top_k,
                     )
 
                     blk_new = torch.where(transfer_blk, x0_blk, blk)

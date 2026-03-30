@@ -10,7 +10,12 @@ import pytest
 import torch
 
 from dllm.utils.sampling import sample_trim, infill_trim
-from dllm.core.samplers.utils import add_gumbel_noise, get_num_transfer_tokens
+from dllm.core.samplers.utils import (
+    add_gumbel_noise,
+    get_num_transfer_tokens,
+    get_token_entropy,
+    select_transfer_positions,
+)
 from dllm.core.schedulers import LinearAlphaScheduler
 
 
@@ -170,3 +175,70 @@ class TestGetNumTransferTokens:
         assert out.shape[0] == 1
         assert out.dtype == torch.int64
         assert (out >= 0).all()
+
+
+# ---------------------------------------------------------------------------
+# entropy-aware scheduling utilities
+# ---------------------------------------------------------------------------
+
+
+class TestGetTokenEntropy:
+    def test_matches_manual_binary_entropy(self):
+        logits = torch.tensor([[[0.0, 0.0], [4.0, 0.0]]], dtype=torch.float32)
+        out = get_token_entropy(logits)
+        assert out.shape == torch.Size([1, 2])
+        # First row is uniform => ln(2)
+        assert out[0, 0].item() == pytest.approx(0.6931, rel=1e-3)
+        # Second row is much lower entropy than the first
+        assert out[0, 1].item() < out[0, 0].item()
+
+    def test_topk_entropy_runs(self):
+        logits = torch.randn(2, 3, 11)
+        out = get_token_entropy(logits, top_k=4)
+        assert out.shape == torch.Size([2, 3])
+        assert torch.isfinite(out).all()
+
+
+class TestSelectTransferPositions:
+    def test_confidence_only_matches_topk_budget(self):
+        confidence = torch.tensor([[0.2, 0.9, 0.7, 0.1]], dtype=torch.float32)
+        mask_index = torch.tensor([[True, True, True, False]])
+        counts = torch.tensor([2], dtype=torch.long)
+
+        out = select_transfer_positions(confidence, mask_index, counts)
+        assert out.tolist() == [[False, True, True, False]]
+
+    def test_entropy_budget_reserves_high_entropy_slot(self):
+        confidence = torch.tensor([[0.95, 0.90, 0.10, 0.05]], dtype=torch.float32)
+        entropy = torch.tensor([[0.05, 0.10, 0.99, 0.20]], dtype=torch.float32)
+        mask_index = torch.tensor([[True, True, True, False]])
+        counts = torch.tensor([2], dtype=torch.long)
+
+        out = select_transfer_positions(
+            confidence,
+            mask_index,
+            counts,
+            entropy_scores=entropy,
+            entropy_first_k=1,
+        )
+
+        # One slot goes to the highest-entropy masked position (idx=2),
+        # the other remains the highest-confidence masked position (idx=0).
+        assert out.tolist() == [[True, False, True, False]]
+
+    def test_entropy_budget_never_exceeds_available_masks(self):
+        confidence = torch.tensor([[0.8, 0.1, 0.2]], dtype=torch.float32)
+        entropy = torch.tensor([[0.3, 0.9, 0.1]], dtype=torch.float32)
+        mask_index = torch.tensor([[True, False, True]])
+        counts = torch.tensor([5], dtype=torch.long)
+
+        out = select_transfer_positions(
+            confidence,
+            mask_index,
+            counts,
+            entropy_scores=entropy,
+            entropy_first_k=3,
+        )
+
+        assert out.sum().item() == 2
+        assert out.tolist() == [[True, False, True]]
