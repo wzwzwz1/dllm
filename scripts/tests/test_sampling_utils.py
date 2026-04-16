@@ -9,12 +9,21 @@ Run from repo root:
 import pytest
 import torch
 
+from types import SimpleNamespace
+
+from dllm.core.samplers import MDLMSampler, MDLMSamplerConfig
 from dllm.utils.sampling import sample_trim, infill_trim
 from dllm.core.samplers.utils import (
     add_gumbel_noise,
+    build_priority_scores,
+    build_structure_prior_scores,
+    compute_tentative_finalize_mask,
+    compute_tentative_rollback_mask,
     get_num_transfer_tokens,
+    get_top1_margin,
     get_token_entropy,
     select_transfer_positions,
+    update_tentative_stats,
 )
 from dllm.core.schedulers import LinearAlphaScheduler
 
@@ -28,7 +37,6 @@ def _make_mock_tokenizer(
     mask_token_id=2,
 ):
     """Minimal tokenizer-like object for testing trim functions."""
-    from types import SimpleNamespace
     tok = SimpleNamespace()
     tok.pad_token_id = pad_token_id
     tok.eos_token_id = eos_token_id
@@ -45,7 +53,41 @@ def _make_mock_tokenizer(
         return "".join(chr(ord("a") + (i % 26)) for i in ids)
 
     tok.decode = decode
+    tok.id_to_token = {
+        0: "<pad>",
+        1: "</s>",
+        2: "<mask>",
+        3: "=",
+        4: "because",
+        5: "alpha",
+        6: "beta",
+        7: "word",
+        8: "(",
+        9: ")",
+        10: "prompt",
+    }
+
+    def convert_ids_to_tokens(ids):
+        return [tok.id_to_token.get(i, str(i)) for i in ids]
+
+    tok.convert_ids_to_tokens = convert_ids_to_tokens
     return tok
+
+
+class _MockModel:
+    def __init__(self, logits_by_call):
+        self.logits_by_call = logits_by_call
+        self.device = torch.device("cpu")
+        self.call_count = 0
+
+    def eval(self):
+        return self
+
+    def __call__(self, input_ids, attention_mask=None):
+        idx = min(self.call_count, len(self.logits_by_call) - 1)
+        logits = self.logits_by_call[idx].clone().to(input_ids.device)
+        self.call_count += 1
+        return SimpleNamespace(logits=logits)
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +241,96 @@ class TestGetTokenEntropy:
         assert torch.isfinite(out).all()
 
 
+class TestPriorityHelpers:
+    def test_get_top1_margin(self):
+        logits = torch.tensor([[[3.0, 1.0, 0.0]]], dtype=torch.float32)
+        out = get_top1_margin(logits)
+        assert out.shape == torch.Size([1, 1])
+        assert out.item() > 0.5
+
+    def test_structure_prior_none_returns_zero(self):
+        tokenizer = _make_mock_tokenizer()
+        x = torch.tensor([[3, 7, 4]], dtype=torch.long)
+        mask = torch.tensor([[True, True, False]])
+        out = build_structure_prior_scores(tokenizer, x, mask, "none", 1.0)
+        assert out.tolist() == [[0.0, 0.0, 0.0]]
+
+    def test_structure_prior_detects_structural_tokens(self):
+        tokenizer = _make_mock_tokenizer()
+        x = torch.tensor([[3, 7, 4]], dtype=torch.long)
+        mask = torch.tensor([[True, True, True]])
+        out = build_structure_prior_scores(tokenizer, x, mask, "token_type", 1.0)
+        assert out[0, 0].item() > out[0, 1].item()
+        assert out[0, 2].item() > out[0, 1].item()
+
+    def test_build_priority_scores_can_disable_components(self):
+        entropy = torch.tensor([[0.8, 0.2]], dtype=torch.float32)
+        confidence = torch.tensor([[0.3, 0.3]], dtype=torch.float32)
+        structure = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+        age = torch.tensor([[2.0, 0.0]], dtype=torch.float32)
+        out = build_priority_scores(
+            entropy,
+            confidence,
+            structure,
+            age,
+            entropy_weight=1.0,
+            structure_weight=0.0,
+            age_weight=0.0,
+            confidence_weight=0.0,
+        )
+        assert out.tolist() == [[0.8, 0.2]]
+
+    def test_update_tentative_stats_tracks_flip_and_stability(self):
+        tentative_mask = torch.tensor([[True, False]])
+        current_top1 = torch.tensor([[5, 6]], dtype=torch.long)
+        current_conf = torch.tensor([[0.7, 0.1]], dtype=torch.float32)
+        current_margin = torch.tensor([[0.4, 0.1]], dtype=torch.float32)
+        stats = update_tentative_stats(
+            current_top1=current_top1,
+            current_conf=current_conf,
+            current_margin=current_margin,
+            tentative_mask=tentative_mask,
+            tentative_token_ids=torch.zeros((1, 2), dtype=torch.long),
+            tentative_age=torch.zeros((1, 2), dtype=torch.long),
+            tentative_flip_count=torch.zeros((1, 2), dtype=torch.long),
+            tentative_last_top1=torch.tensor([[4, -1]], dtype=torch.long),
+            tentative_stable_run=torch.zeros((1, 2), dtype=torch.long),
+            tentative_last_conf=torch.zeros((1, 2), dtype=torch.float32),
+            tentative_last_margin=torch.zeros((1, 2), dtype=torch.float32),
+        )
+        assert stats[1][0, 0].item() == 1
+        assert stats[2][0, 0].item() == 1
+        assert stats[4][0, 0].item() == 1
+
+    def test_finalize_mask_supports_stable_or_high_confidence(self):
+        finalize_mask = compute_tentative_finalize_mask(
+            tentative_mask=torch.tensor([[True, True, True]]),
+            tentative_age=torch.tensor([[1, 0, 0]], dtype=torch.long),
+            tentative_stable_run=torch.tensor([[2, 1, 1]], dtype=torch.long),
+            tentative_last_conf=torch.tensor([[0.6, 0.9, 0.3]], dtype=torch.float32),
+            tentative_last_margin=torch.tensor([[0.2, 0.1, 0.4]], dtype=torch.float32),
+            min_hold_steps=1,
+            stable_steps=2,
+            final_prob_thresh=0.82,
+            final_margin_thresh=0.35,
+        )
+        assert finalize_mask.tolist() == [[True, True, True]]
+
+    def test_rollback_mask_supports_age_flip_and_low_confidence(self):
+        rollback_mask = compute_tentative_rollback_mask(
+            tentative_mask=torch.tensor([[True, True, True]]),
+            tentative_age=torch.tensor([[3, 1, 1]], dtype=torch.long),
+            tentative_flip_count=torch.tensor([[0, 2, 0]], dtype=torch.long),
+            tentative_last_conf=torch.tensor([[0.6, 0.6, 0.3]], dtype=torch.float32),
+            tentative_stable_run=torch.tensor([[1, 1, 1]], dtype=torch.long),
+            max_hold_steps=3,
+            rollback_prob_thresh=0.45,
+            flip_thresh=2,
+            stable_steps=2,
+        )
+        assert rollback_mask.tolist() == [[True, True, True]]
+
+
 class TestSelectTransferPositions:
     def test_confidence_only_matches_topk_budget(self):
         confidence = torch.tensor([[0.2, 0.9, 0.7, 0.1]], dtype=torch.float32)
@@ -242,3 +374,103 @@ class TestSelectTransferPositions:
 
         assert out.sum().item() == 2
         assert out.tolist() == [[True, False, True]]
+
+
+class TestMDLMSamplerExtensions:
+    def _make_sampler(self, logits_by_call):
+        tokenizer = _make_mock_tokenizer(mask_token_id=2)
+        model = _MockModel(logits_by_call=logits_by_call)
+        return MDLMSampler(model=model, tokenizer=tokenizer)
+
+    def test_default_flags_preserve_baseline_output(self):
+        logits = torch.full((1, 3, 12), -10.0, dtype=torch.float32)
+        logits[0, 1, 5] = 5.0
+        logits[0, 2, 6] = 5.0
+        inputs = [[10]]
+
+        sampler_a = self._make_sampler([logits, logits])
+        sampler_b = self._make_sampler([logits, logits])
+
+        out_a = sampler_a.sample(
+            inputs,
+            MDLMSamplerConfig(steps=4, max_new_tokens=2, block_size=2),
+            return_dict=False,
+        )
+        out_b = sampler_b.sample(
+            inputs,
+            MDLMSamplerConfig(
+                steps=4,
+                max_new_tokens=2,
+                block_size=2,
+                enable_entropy_priority=False,
+                enable_tentative_commit=False,
+                enable_targeted_remask=False,
+                enable_structure_priority=False,
+                enable_priority_age_bonus=False,
+            ),
+            return_dict=False,
+        )
+        assert torch.equal(out_a, out_b)
+
+    def test_tentative_commit_enters_without_rollback_when_disabled(self):
+        logits_1 = torch.full((1, 3, 12), -6.0, dtype=torch.float32)
+        logits_2 = torch.full((1, 3, 12), -6.0, dtype=torch.float32)
+        logits_1[0, 1, 5] = 1.0
+        logits_1[0, 2, 6] = 1.0
+        logits_2[0, 1, 5] = 3.0
+        logits_2[0, 2, 6] = 3.0
+
+        sampler = self._make_sampler([logits_1, logits_2, logits_2])
+        sampler.sample(
+            [[10]],
+            MDLMSamplerConfig(
+                steps=4,
+                max_new_tokens=2,
+                block_size=2,
+                enable_entropy_priority=True,
+                entropy_min_tokens_per_step=1,
+                entropy_early_ratio=1.0,
+                enable_tentative_commit=True,
+                enable_targeted_remask=False,
+                tentative_budget_ratio=1.0,
+                enable_sampler_diagnostics=True,
+            ),
+            return_dict=False,
+        )
+        diagnostics = sampler._last_sampler_diagnostics
+        assert diagnostics["tentative_enter_count"] > 0
+        assert diagnostics["tentative_rollback_count"] == 0
+
+    def test_targeted_remask_can_rollback_tentative_tokens(self):
+        logits_1 = torch.full((1, 3, 12), -6.0, dtype=torch.float32)
+        logits_2 = torch.full((1, 3, 12), -6.0, dtype=torch.float32)
+        logits_3 = torch.full((1, 3, 12), -6.0, dtype=torch.float32)
+        logits_1[0, 1, 5] = 1.0
+        logits_1[0, 2, 6] = 1.0
+        logits_2[0, 1, 7] = 0.2
+        logits_2[0, 2, 6] = 3.0
+        logits_3[0, 1, 5] = 3.0
+        logits_3[0, 2, 6] = 3.0
+
+        sampler = self._make_sampler([logits_1, logits_2, logits_3, logits_3])
+        sampler.sample(
+            [[10]],
+            MDLMSamplerConfig(
+                steps=4,
+                max_new_tokens=2,
+                block_size=2,
+                enable_entropy_priority=True,
+                entropy_min_tokens_per_step=1,
+                entropy_early_ratio=1.0,
+                enable_tentative_commit=True,
+                enable_targeted_remask=True,
+                tentative_budget_ratio=1.0,
+                remask_flip_thresh=1,
+                remask_rollback_prob_thresh=0.95,
+                enable_sampler_diagnostics=True,
+            ),
+            return_dict=False,
+        )
+        diagnostics = sampler._last_sampler_diagnostics
+        assert diagnostics["tentative_enter_count"] > 0
+        assert diagnostics["tentative_rollback_count"] > 0

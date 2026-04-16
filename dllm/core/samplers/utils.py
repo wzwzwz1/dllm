@@ -3,6 +3,54 @@ import torch.nn.functional as F
 
 from dllm.core.schedulers import BaseAlphaScheduler
 
+_STRUCTURE_SYMBOLS = {
+    "=",
+    "+",
+    "-",
+    "*",
+    "/",
+    "(",
+    ")",
+    "[",
+    "]",
+    "{",
+    "}",
+    ":",
+    ",",
+    ".",
+    ";",
+}
+_LOGICAL_CONNECTORS = {
+    "because",
+    "therefore",
+    "thus",
+    "however",
+    "so",
+    "then",
+    "first",
+    "next",
+    "finally",
+}
+_CODE_KEYWORDS = {"def", "if", "else", "for", "while", "return", "class", "try"}
+
+
+def _normalize_token(token: str) -> str:
+    token = str(token)
+    for prefix in ("Ġ", "▁", "Ċ", "ĠĠ"):
+        token = token.replace(prefix, "")
+    return token.strip().lower()
+
+
+def _token_has_structure(token: str) -> bool:
+    normalized = _normalize_token(token)
+    if not normalized:
+        return False
+    if token in _STRUCTURE_SYMBOLS or normalized in _STRUCTURE_SYMBOLS:
+        return True
+    if normalized in _LOGICAL_CONNECTORS or normalized in _CODE_KEYWORDS:
+        return True
+    return any(char in _STRUCTURE_SYMBOLS for char in normalized if len(normalized) == 1)
+
 
 def get_num_transfer_tokens(
     mask_index: torch.Tensor,
@@ -102,6 +150,179 @@ def get_token_entropy(
     log_probs = F.log_softmax(logits, dim=-1)
     probs = log_probs.exp()
     return -(probs * log_probs).sum(dim=-1)
+
+
+def get_top1_margin(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Compute per-position top-1 minus top-2 probability margin.
+    """
+    probs = F.softmax(logits.to(torch.float32), dim=-1)
+    top2 = torch.topk(probs, k=min(2, probs.size(-1)), dim=-1).values
+    if top2.size(-1) == 1:
+        return top2[..., 0]
+    return top2[..., 0] - top2[..., 1]
+
+
+def build_structure_prior_scores(
+    tokenizer,
+    x: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    mode: str,
+    strength: float,
+    *,
+    context_tokens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Build lightweight structure priors from predicted token ids.
+
+    `x` is expected to be the candidate token ids (e.g. current top-1 prediction).
+    When `mode="token_type_with_context"`, `context_tokens` is used to add a
+    small bonus for positions next to structural tokens already present in the
+    current sequence.
+    """
+    scores = torch.zeros_like(candidate_mask, dtype=torch.float32)
+    if mode == "none" or strength <= 0:
+        return scores
+    if not hasattr(tokenizer, "convert_ids_to_tokens"):
+        return scores
+
+    flat_tokens = tokenizer.convert_ids_to_tokens(x.detach().cpu().reshape(-1).tolist())
+    structural = torch.zeros_like(candidate_mask, dtype=torch.bool)
+    for idx, token in enumerate(flat_tokens):
+        structural.view(-1)[idx] = _token_has_structure(token)
+    scores = scores + structural.to(torch.float32) * float(strength)
+
+    if mode == "token_type_with_context" and context_tokens is not None:
+        context_flat_tokens = tokenizer.convert_ids_to_tokens(
+            context_tokens.detach().cpu().reshape(-1).tolist()
+        )
+        context_structural = torch.zeros_like(candidate_mask, dtype=torch.bool)
+        for idx, token in enumerate(context_flat_tokens):
+            context_structural.view(-1)[idx] = _token_has_structure(token)
+
+        neighbor_bonus = torch.zeros_like(candidate_mask, dtype=torch.bool)
+        neighbor_bonus[:, :-1] |= context_structural[:, 1:]
+        neighbor_bonus[:, 1:] |= context_structural[:, :-1]
+        scores = scores + neighbor_bonus.to(torch.float32) * float(strength) * 0.5
+
+    return torch.where(candidate_mask, scores, torch.zeros_like(scores))
+
+
+def build_priority_scores(
+    entropy_scores: torch.Tensor,
+    confidence: torch.Tensor,
+    structure_scores: torch.Tensor,
+    age_scores: torch.Tensor,
+    *,
+    entropy_weight: float = 1.0,
+    structure_weight: float = 0.8,
+    age_weight: float = 0.4,
+    confidence_weight: float = 0.6,
+) -> torch.Tensor:
+    """
+    Compose the structure-aware tentative priority score.
+    """
+    return (
+        entropy_weight * entropy_scores.to(torch.float32)
+        + structure_weight * structure_scores.to(torch.float32)
+        + age_weight * age_scores.to(torch.float32)
+        - confidence_weight * confidence.to(torch.float32)
+    )
+
+
+def update_tentative_stats(
+    *,
+    current_top1: torch.Tensor,
+    current_conf: torch.Tensor,
+    current_margin: torch.Tensor,
+    tentative_mask: torch.Tensor,
+    tentative_token_ids: torch.Tensor,
+    tentative_age: torch.Tensor,
+    tentative_flip_count: torch.Tensor,
+    tentative_last_top1: torch.Tensor,
+    tentative_stable_run: torch.Tensor,
+    tentative_last_conf: torch.Tensor,
+    tentative_last_margin: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """
+    Update per-position statistics for tokens currently in TENTATIVE state.
+    """
+    active = tentative_mask
+    token_changed = active & (current_top1 != tentative_last_top1)
+
+    tentative_age = torch.where(active, tentative_age + 1, tentative_age)
+    tentative_flip_count = torch.where(
+        active, tentative_flip_count + token_changed.to(torch.long), tentative_flip_count
+    )
+    tentative_stable_run = torch.where(
+        active,
+        torch.where(
+            token_changed,
+            torch.ones_like(tentative_stable_run),
+            tentative_stable_run + 1,
+        ),
+        tentative_stable_run,
+    )
+    tentative_token_ids = torch.where(active, current_top1, tentative_token_ids)
+    tentative_last_top1 = torch.where(active, current_top1, tentative_last_top1)
+    tentative_last_conf = torch.where(active, current_conf, tentative_last_conf)
+    tentative_last_margin = torch.where(active, current_margin, tentative_last_margin)
+
+    return (
+        tentative_token_ids,
+        tentative_age,
+        tentative_flip_count,
+        tentative_last_top1,
+        tentative_stable_run,
+        tentative_last_conf,
+        tentative_last_margin,
+    )
+
+
+def compute_tentative_finalize_mask(
+    *,
+    tentative_mask: torch.Tensor,
+    tentative_age: torch.Tensor,
+    tentative_stable_run: torch.Tensor,
+    tentative_last_conf: torch.Tensor,
+    tentative_last_margin: torch.Tensor,
+    min_hold_steps: int,
+    stable_steps: int,
+    final_prob_thresh: float,
+    final_margin_thresh: float,
+) -> torch.Tensor:
+    """
+    Compute which TENTATIVE positions are stable enough to finalize.
+    """
+    stable_enough = (tentative_age >= min_hold_steps) & (
+        tentative_stable_run >= stable_steps
+    )
+    high_prob = tentative_last_conf >= final_prob_thresh
+    high_margin = tentative_last_margin >= final_margin_thresh
+    return tentative_mask & (stable_enough | high_prob | high_margin)
+
+
+def compute_tentative_rollback_mask(
+    *,
+    tentative_mask: torch.Tensor,
+    tentative_age: torch.Tensor,
+    tentative_flip_count: torch.Tensor,
+    tentative_last_conf: torch.Tensor,
+    tentative_stable_run: torch.Tensor,
+    max_hold_steps: int,
+    rollback_prob_thresh: float,
+    flip_thresh: int,
+    stable_steps: int,
+) -> torch.Tensor:
+    """
+    Compute which TENTATIVE positions should be remasked.
+    """
+    aged_unstable = (tentative_age >= max_hold_steps) & (
+        tentative_stable_run < stable_steps
+    )
+    too_many_flips = tentative_flip_count >= flip_thresh
+    low_confidence = tentative_last_conf <= rollback_prob_thresh
+    return tentative_mask & (aged_unstable | too_many_flips | low_confidence)
 
 
 def select_transfer_positions(
