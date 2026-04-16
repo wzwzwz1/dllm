@@ -231,7 +231,68 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
   --structure_prior_strength 1.0
 ```
 
-## 9. 如果你想保留日志
+## 9. 指定 `gsm8k` 数据集并只跑 20 条
+
+如果你想在评测链路里指定 `gsm8k`，这里应当使用仓库当前的任务名：
+
+- `gsm8k_cot`
+
+也就是通过 `/Users/wz/code/dllm/dllm/pipelines/llada/eval.py` 跑 `lm-eval` 时，推荐命令如下。
+
+### 9.1 Baseline：`gsm8k_cot --limit 20`
+
+```bash
+source ~/.zshrc
+conda activate ~/miniconda3/envs/dllm
+cd /Users/wz/code/dllm
+export PYTHONPATH=.:$PYTHONPATH
+
+accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+  --tasks gsm8k_cot \
+  --num_fewshot 5 \
+  --limit 20 \
+  --model llada \
+  --apply_chat_template \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0"
+```
+
+### 9.2 只开 entropy priority：`gsm8k_cot --limit 20`
+
+```bash
+accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+  --tasks gsm8k_cot \
+  --num_fewshot 5 \
+  --limit 20 \
+  --model llada \
+  --apply_chat_template \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64"
+```
+
+### 9.3 开 tentative + targeted remask：`gsm8k_cot --limit 20`
+
+```bash
+accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+  --tasks gsm8k_cot \
+  --num_fewshot 5 \
+  --limit 20 \
+  --model llada \
+  --apply_chat_template \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3"
+```
+
+### 9.4 再加 structure priority：`gsm8k_cot --limit 20`
+
+```bash
+accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+  --tasks gsm8k_cot \
+  --num_fewshot 5 \
+  --limit 20 \
+  --model llada \
+  --apply_chat_template \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3"
+```
+
+## 10. 如果你想保留日志
 
 建议先建日志目录：
 
@@ -266,14 +327,14 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
   2>&1 | tee /Users/wz/code/dllm/.logs/mdlm-sample-tentative-remask.log
 ```
 
-## 10. 常见建议
+## 11. 常见建议
 
 - 先跑 `/Users/wz/code/dllm/scripts/tests/test_sampling_utils.py`，不要一上来就全量 `pytest`
-- 先做 `sample.py` 冒烟测试，再跑 benchmark
+- 先做 `sample.py` 冒烟测试，再跑 `gsm8k_cot --limit 20`
 - 做对比实验时固定 `seed`、`steps`、`block_size`、`temperature`
 - 所有新能力默认应可关闭，所以如果出现异常，先退回 baseline 配置确认问题是否来自新开关
 
-## 11. 我建议你实际执行的最小命令集合
+## 12. 我建议你实际执行的最小命令集合
 
 如果你现在只是想最快验证本次改动，直接按这个顺序执行就够了：
 
@@ -317,6 +378,22 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
   --entropy_early_ratio 0.3 \
   --entropy_top_k 64 \
   --structure_prior_mode token_type_with_context
+
+accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+  --tasks gsm8k_cot \
+  --num_fewshot 5 \
+  --limit 20 \
+  --model llada \
+  --apply_chat_template \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0"
+
+accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+  --tasks gsm8k_cot \
+  --num_fewshot 5 \
+  --limit 20 \
+  --model llada \
+  --apply_chat_template \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3"
 ```
 
 如果这几步都正常，再继续做更大的 benchmark。
