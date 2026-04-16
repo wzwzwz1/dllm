@@ -1,6 +1,6 @@
 # MDLM 测试运行说明
 
-本文档说明如何在 `/Users/wz/code/dllm` 中运行当前项目的测试，重点覆盖：
+本文档说明如何在 `/disk/wangzhe/dllm` 中运行当前项目的测试，重点覆盖：
 
 - Python 单元测试
 - 本次 `MDLM Entropy-Priority` 改动相关的回归测试
@@ -15,7 +15,7 @@
 ```bash
 source ~/.zshrc
 conda activate ~/miniconda3/envs/dllm
-cd /Users/wz/code/dllm
+cd /disk/wangzhe/dllm
 export PYTHONPATH=.:$PYTHONPATH
 ```
 
@@ -25,7 +25,7 @@ export PYTHONPATH=.:$PYTHONPATH
 source ~/.zshrc
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate ~/miniconda3/envs/dllm
-cd /Users/wz/code/dllm
+cd /disk/wangzhe/dllm
 export PYTHONPATH=.:$PYTHONPATH
 ```
 
@@ -38,13 +38,13 @@ pytest --version
 
 ## 2. 测试目录
 
-当前仓库使用 `pytest`，测试目录由 `/Users/wz/code/dllm/pyproject.toml` 指定为：
+当前仓库使用 `pytest`，测试目录由 `/disk/wangzhe/dllm/pyproject.toml` 指定为：
 
-- `/Users/wz/code/dllm/scripts/tests`
+- `/disk/wangzhe/dllm/scripts/tests`
 
 和这次改动最相关的测试文件是：
 
-- `/Users/wz/code/dllm/scripts/tests/test_sampling_utils.py`
+- `/disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py`
 
 ## 3. 先跑最关键的单测
 
@@ -53,23 +53,23 @@ pytest --version
 ```bash
 source ~/.zshrc
 conda activate ~/miniconda3/envs/dllm
-cd /Users/wz/code/dllm
+cd /disk/wangzhe/dllm
 export PYTHONPATH=.:$PYTHONPATH
-pytest /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py -v
+pytest /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py -v
 ```
 
 如果你只想跑某一类测试，可以加 `-k`：
 
 ```bash
-pytest /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py -k tentative -v
-pytest /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py -k structure -v
-pytest /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py -k rollback -v
+pytest /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py -k tentative -v
+pytest /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py -k structure -v
+pytest /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py -k rollback -v
 ```
 
 如果你只想快速看结果，可以用：
 
 ```bash
-pytest /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py -q
+pytest /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py -q
 ```
 
 ## 4. 运行全部 Python 单元测试
@@ -79,7 +79,7 @@ pytest /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py -q
 ```bash
 source ~/.zshrc
 conda activate ~/miniconda3/envs/dllm
-cd /Users/wz/code/dllm
+cd /disk/wangzhe/dllm
 export PYTHONPATH=.:$PYTHONPATH
 pytest
 ```
@@ -87,7 +87,7 @@ pytest
 或者显式指定测试目录：
 
 ```bash
-pytest /Users/wz/code/dllm/scripts/tests -v
+pytest /disk/wangzhe/dllm/scripts/tests -v
 ```
 
 ## 5. 推荐的回归测试顺序
@@ -102,10 +102,10 @@ pytest /Users/wz/code/dllm/scripts/tests -v
 一个更稳妥的顺序示例：
 
 ```bash
-pytest /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py -v
-pytest /Users/wz/code/dllm/scripts/tests/test_schedulers.py -v
-pytest /Users/wz/code/dllm/scripts/tests/test_eval_base.py -v
-pytest /Users/wz/code/dllm/scripts/tests -v
+pytest /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py -v
+pytest /disk/wangzhe/dllm/scripts/tests/test_schedulers.py -v
+pytest /disk/wangzhe/dllm/scripts/tests/test_eval_base.py -v
+pytest /disk/wangzhe/dllm/scripts/tests -v
 ```
 
 ## 6. GPU 环境检查
@@ -138,9 +138,9 @@ export CUDA_VISIBLE_DEVICES=0
 
 ```bash
 python -m py_compile \
-  /Users/wz/code/dllm/dllm/core/samplers/utils.py \
-  /Users/wz/code/dllm/dllm/core/samplers/mdlm.py \
-  /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py
+  /disk/wangzhe/dllm/dllm/core/samplers/utils.py \
+  /disk/wangzhe/dllm/dllm/core/samplers/mdlm.py \
+  /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py
 ```
 
 ## 8. MDLM 小样本验证
@@ -150,14 +150,14 @@ python -m py_compile \
 先设置模型路径：
 
 ```bash
-MODEL_PATH="你的模型本地路径"
+MODEL_PATH=/disk/wangzhe/.cache/huggingface/hub/models--GSAI-ML--LLaDA-8B-Instruct/snapshots/08b83a6feb34df1a6011b80c3c00c7563e963b07
 echo "$MODEL_PATH"
 ```
 
 ### 8.1 Baseline
 
 ```bash
-python -u /Users/wz/code/dllm/examples/llada/sample.py \
+python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --model_name_or_path "$MODEL_PATH" \
   --seed 42 \
   --visualize False \
@@ -171,7 +171,7 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
 ### 8.2 只开 entropy priority，不开 tentative
 
 ```bash
-python -u /Users/wz/code/dllm/examples/llada/sample.py \
+python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --model_name_or_path "$MODEL_PATH" \
   --seed 42 \
   --visualize False \
@@ -188,7 +188,7 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
 ### 8.3 开 tentative + targeted remask
 
 ```bash
-python -u /Users/wz/code/dllm/examples/llada/sample.py \
+python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --model_name_or_path "$MODEL_PATH" \
   --seed 42 \
   --visualize False \
@@ -211,7 +211,7 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
 ### 8.4 在 8.3 基础上再开 structure priority
 
 ```bash
-python -u /Users/wz/code/dllm/examples/llada/sample.py \
+python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --model_name_or_path "$MODEL_PATH" \
   --seed 42 \
   --visualize False \
@@ -237,59 +237,75 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
 
 - `gsm8k_cot`
 
-也就是通过 `/Users/wz/code/dllm/dllm/pipelines/llada/eval.py` 跑 `lm-eval` 时，推荐命令如下。
+也就是通过 `/disk/wangzhe/dllm/dllm/pipelines/llada/eval.py` 跑 `lm-eval` 时，推荐命令如下。
+
+如果你正好有 4 张卡，最省时间的方式是：
+
+- 先执行一次公共环境初始化
+- 再分别把下面 4 条命令放到 4 个 shell 中运行
+- 或者在同一个 shell 里分别加 `nohup` 和 `&`
+
+建议先创建日志目录：
+
+```bash
+mkdir -p /disk/wangzhe/dllm/.logs
+```
 
 ### 9.1 Baseline：`gsm8k_cot --limit 20`
 
 ```bash
 source ~/.zshrc
 conda activate ~/miniconda3/envs/dllm
-cd /Users/wz/code/dllm
+cd /disk/wangzhe/dllm
 export PYTHONPATH=.:$PYTHONPATH
 
-accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval.py \
   --tasks gsm8k_cot \
   --num_fewshot 5 \
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0"
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0" \
+  2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-baseline-gpu0.log
 ```
 
 ### 9.2 只开 entropy priority：`gsm8k_cot --limit 20`
 
 ```bash
-accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+CUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval.py \
   --tasks gsm8k_cot \
   --num_fewshot 5 \
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64"
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64" \
+  2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-entropy-only-gpu1.log
 ```
 
 ### 9.3 开 tentative + targeted remask：`gsm8k_cot --limit 20`
 
 ```bash
-accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+CUDA_VISIBLE_DEVICES=2 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval.py \
   --tasks gsm8k_cot \
   --num_fewshot 5 \
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3"
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3" \
+  2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.log
 ```
 
 ### 9.4 再加 structure priority：`gsm8k_cot --limit 20`
 
 ```bash
-accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+CUDA_VISIBLE_DEVICES=3 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval.py \
   --tasks gsm8k_cot \
   --num_fewshot 5 \
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3"
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3" \
+  2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-structure-priority-gpu3.log
 ```
 
 ## 10. 如果你想保留日志
@@ -297,20 +313,20 @@ accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eva
 建议先建日志目录：
 
 ```bash
-mkdir -p /Users/wz/code/dllm/.logs
+mkdir -p /disk/wangzhe/dllm/.logs
 ```
 
 例如把关键单测结果保存下来：
 
 ```bash
-pytest /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py -v \
-  2>&1 | tee /Users/wz/code/dllm/.logs/test-sampling-utils.log
+pytest /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py -v \
+  2>&1 | tee /disk/wangzhe/dllm/.logs/test-sampling-utils.log
 ```
 
 把小样本推理结果保存下来：
 
 ```bash
-python -u /Users/wz/code/dllm/examples/llada/sample.py \
+python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --model_name_or_path "$MODEL_PATH" \
   --seed 42 \
   --visualize False \
@@ -324,12 +340,12 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
   --entropy_min_tokens_per_step 1 \
   --entropy_early_ratio 0.3 \
   --entropy_top_k 64 \
-  2>&1 | tee /Users/wz/code/dllm/.logs/mdlm-sample-tentative-remask.log
+  2>&1 | tee /disk/wangzhe/dllm/.logs/mdlm-sample-tentative-remask.log
 ```
 
 ## 11. 常见建议
 
-- 先跑 `/Users/wz/code/dllm/scripts/tests/test_sampling_utils.py`，不要一上来就全量 `pytest`
+- 先跑 `/disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py`，不要一上来就全量 `pytest`
 - 先做 `sample.py` 冒烟测试，再跑 `gsm8k_cot --limit 20`
 - 做对比实验时固定 `seed`、`steps`、`block_size`、`temperature`
 - 所有新能力默认应可关闭，所以如果出现异常，先退回 baseline 配置确认问题是否来自新开关
@@ -341,17 +357,17 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
 ```bash
 source ~/.zshrc
 conda activate ~/miniconda3/envs/dllm
-cd /Users/wz/code/dllm
+cd /disk/wangzhe/dllm
 export PYTHONPATH=.:$PYTHONPATH
 
-pytest /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py -v
+pytest /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py -v
 
 python -m py_compile \
-  /Users/wz/code/dllm/dllm/core/samplers/utils.py \
-  /Users/wz/code/dllm/dllm/core/samplers/mdlm.py \
-  /Users/wz/code/dllm/scripts/tests/test_sampling_utils.py
+  /disk/wangzhe/dllm/dllm/core/samplers/utils.py \
+  /disk/wangzhe/dllm/dllm/core/samplers/mdlm.py \
+  /disk/wangzhe/dllm/scripts/tests/test_sampling_utils.py
 
-python -u /Users/wz/code/dllm/examples/llada/sample.py \
+python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --model_name_or_path "$MODEL_PATH" \
   --seed 42 \
   --visualize False \
@@ -361,7 +377,7 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
   --temperature 0.0 \
   --entropy_min_tokens_per_step 0
 
-python -u /Users/wz/code/dllm/examples/llada/sample.py \
+python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --model_name_or_path "$MODEL_PATH" \
   --seed 42 \
   --visualize False \
@@ -379,7 +395,7 @@ python -u /Users/wz/code/dllm/examples/llada/sample.py \
   --entropy_top_k 64 \
   --structure_prior_mode token_type_with_context
 
-accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval.py \
   --tasks gsm8k_cot \
   --num_fewshot 5 \
   --limit 20 \
@@ -387,7 +403,7 @@ accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eva
   --apply_chat_template \
   --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0"
 
-accelerate launch --num_processes 1 /Users/wz/code/dllm/dllm/pipelines/llada/eval.py \
+accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval.py \
   --tasks gsm8k_cot \
   --num_fewshot 5 \
   --limit 20 \
