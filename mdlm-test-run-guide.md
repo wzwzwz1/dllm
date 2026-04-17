@@ -251,6 +251,22 @@ python -u /disk/wangzhe/dllm/examples/llada/sample.py \
 mkdir -p /disk/wangzhe/dllm/.logs
 ```
 
+下面这组默认值比之前更适合当前实现：
+
+- `max_new_tokens=512`
+- `steps=64`
+- `block_size=32`
+- `entropy_early_ratio=0.2`
+- `tentative_budget_ratio=0.25`
+
+原因：
+
+- `steps=512` 会让每步预算过碎，tentative 配额容易长期被 floor 成 `0`
+- `steps=64` 可以显著加快评测，同时让 tentative 通道真正参与
+- `block_size=32` 先保持不变，避免一次改太多变量
+- `entropy_early_ratio=0.2` 比 `0.3` 更保守，适合先做稳定对照
+- `tentative_budget_ratio=0.25` 能明显提高 `gpu2/gpu3` 两组的有效介入概率
+
 ### 9.1 Baseline：`gsm8k_cot --limit 20`
 
 ```bash
@@ -265,7 +281,7 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-baseline-gpu0.log
 ```
 
@@ -278,7 +294,7 @@ CUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.2,entropy_top_k=64" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-entropy-only-gpu1.log
 ```
 
@@ -291,7 +307,7 @@ CUDA_VISIBLE_DEVICES=2 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.2,entropy_top_k=64,tentative_budget_ratio=0.25,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.log
 ```
 
@@ -304,7 +320,7 @@ CUDA_VISIBLE_DEVICES=3 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.2,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.25,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-structure-priority-gpu3.log
 ```
 
@@ -401,7 +417,7 @@ accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0"
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0"
 
 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval.py \
   --tasks gsm8k_cot \
@@ -409,7 +425,7 @@ accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=512,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.3,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.1,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3"
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.2,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.25,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3"
 ```
 
 如果这几步都正常，再继续做更大的 benchmark。
