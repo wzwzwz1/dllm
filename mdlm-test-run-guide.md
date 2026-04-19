@@ -362,6 +362,10 @@ mkdir -p /disk/wangzhe/dllm/.logs
 - `generation_trace_max_steps=64`
 - `save_sampler_diagnostics=True`
 
+说明：
+- 现在只要设置 `save_sampler_diagnostics=True`，eval harness 会自动给 sampler 打开逐样本 diagnostics 采集。
+- 不需要再额外手动传 `enable_sampler_diagnostics=True`。
+
 例如：
 
 ```bash

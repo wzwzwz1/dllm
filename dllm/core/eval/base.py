@@ -309,6 +309,12 @@ class BaseEvalHarness(LM):
         ):
             batch = requests[batch_start : batch_start + self.batch_size]
             contexts, gen_kwargs_list = zip(*[inst.args for inst in batch])
+            sampler_kwargs = {}
+            if self.save_sampler_diagnostics:
+                # If eval is asked to persist sampler diagnostics, force per-sample
+                # collection in the sampler so JSONL records don't silently fall
+                # back to batch-level aggregate counters.
+                sampler_kwargs["enable_sampler_diagnostics"] = True
 
             prompts = [
                 torch.tensor(
@@ -325,6 +331,7 @@ class BaseEvalHarness(LM):
                     inputs=prompts,
                     config=self.sampler_config,
                     return_dict=True,
+                    **sampler_kwargs,
                 )
                 generated_ids = sampler_output.sequences
                 traces = self._build_generation_traces(
@@ -337,6 +344,7 @@ class BaseEvalHarness(LM):
                     inputs=prompts,
                     config=self.sampler_config,
                     return_dict=False,
+                    **sampler_kwargs,
                 )
                 traces = None
 
