@@ -96,6 +96,29 @@ def _init_sampler_diagnostics(*, enabled: bool, collect_token_events: bool) -> d
     return diagnostics
 
 
+def _init_per_sample_diagnostics(
+    batch_size: int,
+    *,
+    collect_token_events: bool,
+) -> list[dict]:
+    per_sample = []
+    for sample_idx in range(batch_size):
+        entry = {
+            "sample_index": sample_idx,
+            "entropy_priority_effective": False,
+            "entropy_trigger_count": 0,
+            "entropy_selected_token_count": 0,
+            "tentative_enter_count": 0,
+            "tentative_finalize_count": 0,
+            "tentative_rollback_count": 0,
+            "baseline_finalize_count": 0,
+        }
+        if collect_token_events:
+            entry["token_events"] = []
+        per_sample.append(entry)
+    return per_sample
+
+
 def _append_token_events(
     diagnostics: dict,
     *,
@@ -103,12 +126,31 @@ def _append_token_events(
     event_mask: torch.Tensor,
     step_idx: int,
 ):
-    if "token_event_log" not in diagnostics or not event_mask.any():
+    if not event_mask.any():
         return
     for batch_idx, pos_idx in event_mask.nonzero(as_tuple=False).tolist():
-        diagnostics["token_event_log"].append(
-            {"event": event_name, "step": step_idx, "batch": batch_idx, "pos": pos_idx}
-        )
+        if "token_event_log" in diagnostics:
+            diagnostics["token_event_log"].append(
+                {"event": event_name, "step": step_idx, "batch": batch_idx, "pos": pos_idx}
+            )
+        if "per_sample" in diagnostics and batch_idx < len(diagnostics["per_sample"]):
+            sample_diag = diagnostics["per_sample"][batch_idx]
+            if event_name == "entropy_trigger":
+                sample_diag["entropy_priority_effective"] = True
+                sample_diag["entropy_trigger_count"] += 1
+                sample_diag["entropy_selected_token_count"] += 1
+            elif event_name == "tentative_enter":
+                sample_diag["tentative_enter_count"] += 1
+            elif event_name == "tentative_finalize":
+                sample_diag["tentative_finalize_count"] += 1
+            elif event_name == "tentative_rollback":
+                sample_diag["tentative_rollback_count"] += 1
+            elif event_name == "baseline_finalize":
+                sample_diag["baseline_finalize_count"] += 1
+            if "token_events" in sample_diag:
+                sample_diag["token_events"].append(
+                    {"event": event_name, "step": step_idx, "pos": pos_idx}
+                )
 
 
 def _clear_positions(
@@ -633,6 +675,11 @@ class MDLMSampler(BaseSampler):
             enabled=enable_sampler_diagnostics,
             collect_token_events=diagnostic_collect_token_events,
         )
+        if enable_sampler_diagnostics:
+            diagnostics["per_sample"] = _init_per_sample_diagnostics(
+                B,
+                collect_token_events=diagnostic_collect_token_events,
+            )
         entropy_credit = torch.zeros((B,), device=x.device, dtype=torch.float32)
         global_step_idx = 0
         use_tentative_features = enable_tentative_commit
@@ -782,6 +829,12 @@ class MDLMSampler(BaseSampler):
                 )
                 diagnostics["entropy_trigger_count"] += int(
                     entropy_trigger_counts.sum().item()
+                )
+                _append_token_events(
+                    diagnostics,
+                    event_name="entropy_trigger",
+                    event_mask=entropy_candidate_mask,
+                    step_idx=i,
                 )
 
                 if use_tentative_features:
@@ -1060,6 +1113,11 @@ class MDLMSampler(BaseSampler):
             enabled=enable_sampler_diagnostics,
             collect_token_events=diagnostic_collect_token_events,
         )
+        if enable_sampler_diagnostics:
+            diagnostics["per_sample"] = _init_per_sample_diagnostics(
+                B,
+                collect_token_events=diagnostic_collect_token_events,
+            )
         entropy_credit = torch.zeros((B,), device=x.device, dtype=torch.float32)
         global_step_idx = 0
         use_tentative_features = enable_tentative_commit
@@ -1205,6 +1263,12 @@ class MDLMSampler(BaseSampler):
                 )
                 diagnostics["entropy_trigger_count"] += int(
                     entropy_trigger_counts.sum().item()
+                )
+                _append_token_events(
+                    diagnostics,
+                    event_name="entropy_trigger",
+                    event_mask=entropy_candidate_mask,
+                    step_idx=s,
                 )
 
                 if use_tentative_features:

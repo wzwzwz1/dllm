@@ -286,7 +286,16 @@ class BaseEvalHarness(LM):
                 if traces is not None:
                     record["generation_trace"] = traces[offset]
                 if self.save_sampler_diagnostics and sampler_diagnostics is not None:
-                    record["sampler_diagnostics"] = sampler_diagnostics
+                    if (
+                        isinstance(sampler_diagnostics, dict)
+                        and "per_sample" in sampler_diagnostics
+                        and offset < len(sampler_diagnostics["per_sample"])
+                    ):
+                        record["sampler_diagnostics"] = sampler_diagnostics["per_sample"][
+                            offset
+                        ]
+                    else:
+                        record["sampler_diagnostics"] = sampler_diagnostics
                 writer.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # ── Unified generate_until scaffolding ────────────────────────────

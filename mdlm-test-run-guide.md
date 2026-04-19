@@ -383,6 +383,25 @@ CUDA_VISIBLE_DEVICES=2 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
 - `generation_trace`
 - `sampler_diagnostics`（如果开启）
 
+当前 `sampler_diagnostics` 会按样本保存，重点字段包括：
+
+- `entropy_priority_effective`
+- `entropy_trigger_count`
+- `entropy_selected_token_count`
+- `tentative_enter_count`
+- `tentative_finalize_count`
+- `tentative_rollback_count`
+
+如果同时打开了 token 事件采集，还会有：
+
+- `token_events`
+
+其中会记录每个触发事件对应的：
+
+- `event`
+- `step`
+- `pos`
+
 例如把关键单测结果保存下来：
 
 ```bash
