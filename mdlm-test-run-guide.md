@@ -296,7 +296,7 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-baseline-gpu0.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-baseline-gpu0.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True,diagnostic_collect_step_debug=True,diagnostic_log_interval=1" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-baseline-gpu0.log
 ```
 
@@ -309,7 +309,7 @@ CUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-entropy-only-gpu1.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-entropy-only-gpu1.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True,diagnostic_collect_step_debug=True,diagnostic_log_interval=1" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-entropy-only-gpu1.log
 ```
 
@@ -322,7 +322,7 @@ CUDA_VISIBLE_DEVICES=2 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True,diagnostic_collect_step_debug=True,diagnostic_log_interval=1" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.log
 ```
 
@@ -335,7 +335,7 @@ CUDA_VISIBLE_DEVICES=3 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-structure-priority-gpu3.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-structure-priority-gpu3.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True,diagnostic_collect_step_debug=True,diagnostic_log_interval=1" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-structure-priority-gpu3.log
 ```
 
@@ -361,6 +361,8 @@ mkdir -p /disk/wangzhe/dllm/.logs
 - `save_generation_traces=True`
 - `generation_trace_max_steps=64`
 - `save_sampler_diagnostics=True`
+- `diagnostic_collect_step_debug=True`（可选，记录 step 级 entropy 调试信息）
+- `diagnostic_log_interval=1`（可选，按步记录；设成更大值可抽样）
 
 说明：
 - 现在只要设置 `save_sampler_diagnostics=True`，eval harness 会自动给 sampler 打开逐样本 diagnostics 采集。
@@ -375,7 +377,7 @@ CUDA_VISIBLE_DEVICES=2 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True"
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True,diagnostic_collect_step_debug=True,diagnostic_log_interval=1"
 ```
 
 生成的 `jsonl` 文件中，每一行对应一道题，包含：
@@ -409,6 +411,34 @@ CUDA_VISIBLE_DEVICES=2 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
 如果同时打开了 token 事件采集，还会有：
 
 - `token_events`
+
+如果打开了 `diagnostic_collect_step_debug=True`，每条样本里还会有：
+
+- `step_debug`
+
+其中每一项会记录当前 step 的关键调试信息，例如：
+
+- `step`
+- `step_ratio`
+- `phase_scale`
+- `total_budget`
+- `candidate_count`
+- `quality_candidate_count`
+- `selected_candidate_count`
+- `credit_before`
+- `credit_after_update`
+- `credit_after_spend`
+- `trigger_count`
+- `reason`
+
+常见 `reason` 包括：
+
+- `phase_off`
+- `no_budget`
+- `no_masked_candidates`
+- `no_qualified_candidates`
+- `insufficient_credit`
+- `triggered`
 
 其中会记录每个触发事件对应的：
 

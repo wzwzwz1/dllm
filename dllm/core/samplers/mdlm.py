@@ -79,6 +79,7 @@ class MDLMSamplerConfig(BaseSamplerConfig):
     structure_prior_strength: float = 1.0
     diagnostic_log_interval: int = 1
     diagnostic_collect_token_events: bool = False
+    diagnostic_collect_step_debug: bool = False
 
 
 def _init_sampler_diagnostics(*, enabled: bool, collect_token_events: bool) -> dict:
@@ -102,6 +103,7 @@ def _init_per_sample_diagnostics(
     batch_size: int,
     *,
     collect_token_events: bool,
+    collect_step_debug: bool,
 ) -> list[dict]:
     per_sample = []
     for sample_idx in range(batch_size):
@@ -119,8 +121,30 @@ def _init_per_sample_diagnostics(
         }
         if collect_token_events:
             entry["token_events"] = []
+        if collect_step_debug:
+            entry["step_debug"] = []
         per_sample.append(entry)
     return per_sample
+
+
+def _append_step_debug(
+    diagnostics: dict,
+    *,
+    step_idx: int,
+    step_debug_rows: list[dict],
+    log_interval: int,
+):
+    if "per_sample" not in diagnostics:
+        return
+    should_sample = log_interval <= 1 or (step_idx % log_interval == 0)
+    for batch_idx, row in enumerate(step_debug_rows):
+        if batch_idx >= len(diagnostics["per_sample"]):
+            continue
+        sample_diag = diagnostics["per_sample"][batch_idx]
+        if "step_debug" not in sample_diag:
+            continue
+        if should_sample or row.get("trigger_count", 0) > 0:
+            sample_diag["step_debug"].append(row)
 
 
 def _append_token_events(
@@ -203,11 +227,28 @@ def _compute_entropy_trigger_plan(
     structure_prior_mode: str,
     structure_prior_strength: float,
     logits: torch.Tensor,
-) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor, list[dict]]:
     zero_counts = torch.zeros_like(total_budget, dtype=torch.long)
     zero_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+    zero_debug = [
+        {
+            "step": -1,
+            "step_ratio": float(step_ratio),
+            "phase_scale": 0.0,
+            "total_budget": int(total_budget[row].item()),
+            "candidate_count": int(candidate_mask[row].sum().item()),
+            "quality_candidate_count": 0,
+            "selected_candidate_count": 0,
+            "credit_before": float(entropy_credit[row].item()),
+            "credit_after_update": float(entropy_credit[row].item()),
+            "credit_after_spend": float(entropy_credit[row].item()),
+            "trigger_count": 0,
+            "reason": "disabled",
+        }
+        for row in range(candidate_mask.size(0))
+    ]
     if not enable_entropy_priority or not enable_entropy_credit_scheduler:
-        return None, entropy_credit, zero_counts, zero_mask
+        return None, entropy_credit, zero_counts, zero_mask, zero_debug
 
     phase_scale = compute_entropy_phase_scale(
         step_ratio,
@@ -215,8 +256,26 @@ def _compute_entropy_trigger_plan(
         entropy_active_end_ratio,
         entropy_end_ratio,
     )
+    credit_before = entropy_credit.clone()
     if phase_scale <= 0:
-        return None, entropy_credit, zero_counts, zero_mask
+        phase_debug = [
+            {
+                "step": -1,
+                "step_ratio": float(step_ratio),
+                "phase_scale": float(phase_scale),
+                "total_budget": int(total_budget[row].item()),
+                "candidate_count": int(candidate_mask[row].sum().item()),
+                "quality_candidate_count": 0,
+                "selected_candidate_count": 0,
+                "credit_before": float(credit_before[row].item()),
+                "credit_after_update": float(credit_before[row].item()),
+                "credit_after_spend": float(credit_before[row].item()),
+                "trigger_count": 0,
+                "reason": "phase_off",
+            }
+            for row in range(candidate_mask.size(0))
+        ]
+        return None, entropy_credit, zero_counts, zero_mask, phase_debug
 
     entropy_scores = get_token_entropy(logits, top_k=entropy_top_k)
     entropy_credit = update_entropy_credit(
@@ -224,6 +283,7 @@ def _compute_entropy_trigger_plan(
         phase_scale=phase_scale,
         credit_rate=entropy_credit_rate,
     )
+    credit_after_update = entropy_credit.clone()
 
     structure_scores = build_structure_prior_scores(
         tokenizer,
@@ -248,6 +308,29 @@ def _compute_entropy_trigger_plan(
         age_weight=priority_age_weight,
         confidence_weight=priority_confidence_weight,
     )
+    quality_candidate_counts = torch.zeros_like(total_budget, dtype=torch.long)
+    if entropy_top_candidate_pool > 0:
+        neg = torch.finfo(priority_scores.dtype).min
+        for row in range(priority_scores.size(0)):
+            masked_count = int(candidate_mask[row].sum().item())
+            if masked_count == 0:
+                continue
+            k = min(entropy_top_candidate_pool, masked_count)
+            row_scores = torch.where(
+                candidate_mask[row],
+                priority_scores[row].to(torch.float32),
+                torch.full_like(priority_scores[row], neg, dtype=torch.float32),
+            )
+            top_indices = torch.topk(row_scores, k=k).indices
+            if entropy_use_quality_gate:
+                qualified = (
+                    (structure_scores[row, top_indices] > 0)
+                    | (age_scores[row, top_indices] >= entropy_age_threshold)
+                    | (confidence[row, top_indices] >= entropy_conf_floor)
+                )
+            else:
+                qualified = torch.ones_like(top_indices, dtype=torch.bool)
+            quality_candidate_counts[row] = int(qualified.sum().item())
     entropy_candidate_mask = select_entropy_candidate_mask(
         priority_scores=priority_scores,
         candidate_mask=candidate_mask,
@@ -267,7 +350,42 @@ def _compute_entropy_trigger_plan(
     trigger_counts = torch.minimum(trigger_counts, total_budget.to(torch.long))
     entropy_candidate_mask = entropy_candidate_mask & trigger_counts.unsqueeze(1).bool()
     entropy_credit = entropy_credit - trigger_counts.to(entropy_credit.dtype)
-    return entropy_scores, entropy_credit, trigger_counts, entropy_candidate_mask
+    selected_candidate_counts = entropy_candidate_mask.sum(dim=1).to(torch.long)
+    step_debug_rows = []
+    for row in range(candidate_mask.size(0)):
+        budget = int(total_budget[row].item())
+        candidate_count = int(candidate_mask[row].sum().item())
+        quality_count = int(quality_candidate_counts[row].item())
+        trigger_count = int(trigger_counts[row].item())
+        if budget <= 0:
+            reason = "no_budget"
+        elif candidate_count <= 0:
+            reason = "no_masked_candidates"
+        elif quality_count <= 0:
+            reason = "no_qualified_candidates"
+        elif float(credit_after_update[row].item()) < 1.0:
+            reason = "insufficient_credit"
+        elif trigger_count > 0:
+            reason = "triggered"
+        else:
+            reason = "ready_not_triggered"
+        step_debug_rows.append(
+            {
+                "step": -1,
+                "step_ratio": float(step_ratio),
+                "phase_scale": float(phase_scale),
+                "total_budget": budget,
+                "candidate_count": candidate_count,
+                "quality_candidate_count": quality_count,
+                "selected_candidate_count": int(selected_candidate_counts[row].item()),
+                "credit_before": float(credit_before[row].item()),
+                "credit_after_update": float(credit_after_update[row].item()),
+                "credit_after_spend": float(entropy_credit[row].item()),
+                "trigger_count": trigger_count,
+                "reason": reason,
+            }
+        )
+    return entropy_scores, entropy_credit, trigger_counts, entropy_candidate_mask, step_debug_rows
 
 
 def _apply_extended_commit_strategy(
@@ -628,6 +746,9 @@ class MDLMSampler(BaseSampler):
         diagnostic_collect_token_events = kwargs.get(
             "diagnostic_collect_token_events", config.diagnostic_collect_token_events
         )
+        diagnostic_collect_step_debug = kwargs.get(
+            "diagnostic_collect_step_debug", config.diagnostic_collect_step_debug
+        )
 
         assert 1 <= block_size
         assert 1 <= requested_steps
@@ -692,6 +813,7 @@ class MDLMSampler(BaseSampler):
             diagnostics["per_sample"] = _init_per_sample_diagnostics(
                 B,
                 collect_token_events=diagnostic_collect_token_events,
+                collect_step_debug=diagnostic_collect_step_debug,
             )
         entropy_credit = torch.zeros((B,), device=x.device, dtype=torch.float32)
         global_step_idx = 0
@@ -808,6 +930,7 @@ class MDLMSampler(BaseSampler):
                     entropy_credit,
                     entropy_trigger_counts,
                     entropy_candidate_mask,
+                    entropy_step_debug_rows,
                 ) = _compute_entropy_trigger_plan(
                     tokenizer=self.tokenizer,
                     x=x,
@@ -840,6 +963,15 @@ class MDLMSampler(BaseSampler):
                     structure_prior_strength=structure_prior_strength,
                     logits=logits,
                 )
+                if enable_sampler_diagnostics and diagnostic_collect_step_debug:
+                    for row in entropy_step_debug_rows:
+                        row["step"] = global_step_idx
+                    _append_step_debug(
+                        diagnostics,
+                        step_idx=global_step_idx,
+                        step_debug_rows=entropy_step_debug_rows,
+                        log_interval=diagnostic_log_interval,
+                    )
                 diagnostics["entropy_trigger_count"] += int(
                     entropy_trigger_counts.sum().item()
                 )
@@ -1085,6 +1217,9 @@ class MDLMSampler(BaseSampler):
         diagnostic_collect_token_events = kwargs.get(
             "diagnostic_collect_token_events", config.diagnostic_collect_token_events
         )
+        diagnostic_collect_step_debug = kwargs.get(
+            "diagnostic_collect_step_debug", config.diagnostic_collect_step_debug
+        )
 
         mask_id = self.tokenizer.mask_token_id
         bos_id = self.tokenizer.bos_token_id
@@ -1146,6 +1281,7 @@ class MDLMSampler(BaseSampler):
             diagnostics["per_sample"] = _init_per_sample_diagnostics(
                 B,
                 collect_token_events=diagnostic_collect_token_events,
+                collect_step_debug=diagnostic_collect_step_debug,
             )
         entropy_credit = torch.zeros((B,), device=x.device, dtype=torch.float32)
         global_step_idx = 0
@@ -1258,6 +1394,7 @@ class MDLMSampler(BaseSampler):
                     entropy_credit,
                     entropy_trigger_counts,
                     entropy_candidate_mask,
+                    entropy_step_debug_rows,
                 ) = _compute_entropy_trigger_plan(
                     tokenizer=self.tokenizer,
                     x=x,
@@ -1290,6 +1427,15 @@ class MDLMSampler(BaseSampler):
                     structure_prior_strength=structure_prior_strength,
                     logits=logits,
                 )
+                if enable_sampler_diagnostics and diagnostic_collect_step_debug:
+                    for row in entropy_step_debug_rows:
+                        row["step"] = global_step_idx
+                    _append_step_debug(
+                        diagnostics,
+                        step_idx=global_step_idx,
+                        step_debug_rows=entropy_step_debug_rows,
+                        log_interval=diagnostic_log_interval,
+                    )
                 diagnostics["entropy_trigger_count"] += int(
                     entropy_trigger_counts.sum().item()
                 )

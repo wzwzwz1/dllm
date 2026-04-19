@@ -581,6 +581,38 @@ class TestMDLMSamplerExtensions:
         assert diagnostics["baseline_finalize_count"] == 1
         assert diagnostics["finalized_token_count"] == 2
 
+    def test_step_debug_records_credit_and_trigger_reason(self):
+        logits = torch.full((1, 3, 12), -6.0, dtype=torch.float32)
+        logits[0, 1, 11] = 2.0
+        logits[0, 2, 5] = 2.0
+        sampler = self._make_sampler([logits, logits, logits, logits])
+        sampler.sample(
+            [[10]],
+            MDLMSamplerConfig(
+                steps=4,
+                max_new_tokens=2,
+                block_size=2,
+                enable_entropy_priority=True,
+                enable_entropy_credit_scheduler=True,
+                entropy_credit_rate=0.4,
+                entropy_warmup_ratio=0.0,
+                entropy_active_end_ratio=1.0,
+                entropy_end_ratio=1.0,
+                enable_tentative_commit=False,
+                entropy_use_quality_gate=False,
+                enable_sampler_diagnostics=True,
+                diagnostic_collect_step_debug=True,
+                diagnostic_log_interval=1,
+            ),
+            return_dict=False,
+        )
+        diagnostics = sampler._last_sampler_diagnostics
+        step_debug = diagnostics["per_sample"][0]["step_debug"]
+        reasons = {row["reason"] for row in step_debug}
+        assert "insufficient_credit" in reasons
+        assert "triggered" in reasons
+        assert any(row["trigger_count"] == 1 for row in step_debug)
+
     def test_structure_priority_can_enable_credit_candidate_selection(self):
         logits = torch.full((1, 3, 12), -8.0, dtype=torch.float32)
         logits[0, 1, 5] = 2.5  # non-structural token with higher raw score
