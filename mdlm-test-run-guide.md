@@ -549,3 +549,136 @@ accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval
 ```
 
 如果这几步都正常，再继续做更大的 benchmark。
+
+## 13. 双 GPU Entropy Grid Search
+
+如果你现在有 `gpu0` 和 `gpu1` 两张卡可用，可以直接使用下面两份顺序脚本：
+
+- [run_entropy_grid_gpu0.sh](/Users/wz/code/dllm/scripts/run_entropy_grid_gpu0.sh)
+- [run_entropy_grid_gpu1.sh](/Users/wz/code/dllm/scripts/run_entropy_grid_gpu1.sh)
+
+这两份脚本会共享同一个 sweep 根目录，总共覆盖 72 个 `entropy-only` 参数组合：
+
+- `entropy_credit_rate`: `0.20, 0.30, 0.40`
+- `entropy_warmup_ratio`: `0.00, 0.05`
+- `entropy_active_end_ratio`: `0.10, 0.15, 0.20`
+- `entropy_end_ratio`: `0.25, 0.30, 0.35, 0.40`
+- `entropy_top_k`: 固定 `64`
+
+其中：
+
+- `gpu0` 跑前 36 组
+- `gpu1` 跑后 36 组
+
+两个脚本都固定使用：
+
+- `tasks=gsm8k_cot`
+- `num_fewshot=5`
+- `limit=200`
+- `max_new_tokens=256`
+- `steps=64`
+- `block_size=32`
+- `cfg_scale=0.0`
+- `begin_suppress_tokens=[126081;126348]`
+- `save_generation_traces=True`
+- `save_sampler_diagnostics=True`
+- `diagnostic_collect_step_debug=True`
+
+### 13.1 启动方式
+
+先在两个终端里分别执行：
+
+```bash
+export MODEL_PATH=/disk/wangzhe/.cache/huggingface/hub/models--GSAI-ML--LLaDA-8B-Instruct/snapshots/08b83a6feb34df1a6011b80c3c00c7563e963b07
+
+bash /disk/wangzhe/dllm/scripts/run_entropy_grid_gpu0.sh
+```
+
+```bash
+export MODEL_PATH=/disk/wangzhe/.cache/huggingface/hub/models--GSAI-ML--LLaDA-8B-Instruct/snapshots/08b83a6feb34df1a6011b80c3c00c7563e963b07
+
+bash /disk/wangzhe/dllm/scripts/run_entropy_grid_gpu1.sh
+```
+
+如果你想手动指定 sweep 目录，也可以在两个终端都先导出同一个 `OUTPUT_ROOT`：
+
+```bash
+export OUTPUT_ROOT=/disk/wangzhe/dllm/.logs/sweeps/20260419-entropy-grid72
+```
+
+### 13.2 输出目录结构
+
+默认情况下，脚本会在下面创建一个共享目录：
+
+```text
+/disk/wangzhe/dllm/.logs/sweeps/{timestamp}-gsm8k-cot-limit200-entropy-grid72/
+```
+
+目录结构大致如下：
+
+```text
+{sweep_root}/
+  sweep_config.json
+  grid_manifest.csv
+  leaderboard.csv
+  leaderboard.md
+  failures.csv
+  runs/
+    r001__cr0p20-wu0p00-ae0p10-ee0p25/
+      command.sh
+      eval.log
+      generation_records.jsonl
+      meta.json
+      done.ok
+```
+
+每个参数组合都会落到独立 `run` 目录中，所以不会再出现日志和 `jsonl` 被覆写的问题。
+
+### 13.3 断点续跑
+
+脚本会自动检查每个 run 目录下是否存在 `done.ok`：
+
+- 如果存在，就跳过这个组合
+- 如果只有 `failed.ok`，再次运行脚本时会重新跑该组合
+
+也就是说，中途中断后，直接重新执行同一份脚本即可继续。
+
+### 13.4 如何看排行榜
+
+每次 run 完成后，脚本都会自动刷新：
+
+- `grid_manifest.csv`
+- `leaderboard.csv`
+- `leaderboard.md`
+- `failures.csv`
+
+默认排序规则是：
+
+1. `Flexible EM` 降序
+2. `Strict EM` 降序
+3. `duration` 升序
+
+你可以直接打开：
+
+- [leaderboard.md](</disk/wangzhe/dllm/.logs/sweeps/leaderboard.md>)
+
+实际文件会在具体的 sweep 根目录下。
+
+### 13.5 只检查某一张 GPU 的失败项
+
+`failures.csv` 里会包含 `assigned_gpu` 字段，所以可以直接按 GPU 过滤：
+
+```bash
+python - <<'PY'
+import csv
+from pathlib import Path
+
+path = Path("/disk/wangzhe/dllm/.logs/sweeps/20260419-entropy-grid72/failures.csv")
+with path.open("r", encoding="utf-8") as handle:
+    rows = list(csv.DictReader(handle))
+
+for row in rows:
+    if row["assigned_gpu"] == "0":
+        print(row["run_id"], row["eval_log_path"])
+PY
+```
