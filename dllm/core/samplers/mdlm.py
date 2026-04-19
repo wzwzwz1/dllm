@@ -749,6 +749,9 @@ class MDLMSampler(BaseSampler):
         diagnostic_collect_step_debug = kwargs.get(
             "diagnostic_collect_step_debug", config.diagnostic_collect_step_debug
         )
+        diagnostic_log_interval = kwargs.get(
+            "diagnostic_log_interval", config.diagnostic_log_interval
+        )
 
         assert 1 <= block_size
         assert 1 <= requested_steps
@@ -1219,6 +1222,9 @@ class MDLMSampler(BaseSampler):
         )
         diagnostic_collect_step_debug = kwargs.get(
             "diagnostic_collect_step_debug", config.diagnostic_collect_step_debug
+        )
+        diagnostic_log_interval = kwargs.get(
+            "diagnostic_log_interval", config.diagnostic_log_interval
         )
 
         mask_id = self.tokenizer.mask_token_id
