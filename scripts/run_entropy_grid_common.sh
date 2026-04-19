@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 GRID_TASK="gsm8k_cot"
 GRID_NUM_FEWSHOT=5
 GRID_LIMIT=200
@@ -16,15 +19,36 @@ GRID_WARMUP_RATIOS=(0.00 0.05)
 GRID_ACTIVE_END_RATIOS=(0.10 0.15 0.20)
 GRID_END_RATIOS=(0.25 0.30 0.35 0.40)
 
-SWEEP_BASE_ROOT="/disk/wangzhe/dllm/.logs/sweeps"
+SWEEP_BASE_ROOT="${REPO_ROOT}/.logs/sweeps"
 SWEEP_REGISTRY_PATH="${SWEEP_BASE_ROOT}/latest-gsm8k-cot-limit200-entropy-grid72.path"
 SWEEP_REGISTRY_LOCK="${SWEEP_BASE_ROOT}/.latest-gsm8k-cot-limit200-entropy-grid72.lock"
 
 ensure_environment() {
-  source ~/.zshrc
-  source /home/wangzhe/miniconda3/etc/profile.d/conda.sh
+  if [[ -f "${HOME}/.zshrc" ]]; then
+    source "${HOME}/.zshrc"
+  fi
+
+  if ! command -v conda >/dev/null 2>&1; then
+    local conda_candidate
+    for conda_candidate in \
+      "${HOME}/miniconda3/etc/profile.d/conda.sh" \
+      "${HOME}/miniforge3/etc/profile.d/conda.sh" \
+      "/disk/wangzhe/miniconda3/etc/profile.d/conda.sh" \
+      "/home/wangzhe/miniconda3/etc/profile.d/conda.sh"; do
+      if [[ -f "${conda_candidate}" ]]; then
+        source "${conda_candidate}"
+        break
+      fi
+    done
+  fi
+
+  if ! command -v conda >/dev/null 2>&1; then
+    echo "Unable to locate conda. Please initialize conda before running this script." >&2
+    exit 1
+  fi
+
   conda activate dllm
-  cd /disk/wangzhe/dllm
+  cd "${REPO_ROOT}"
   export PYTHONPATH=.:$PYTHONPATH
 }
 
@@ -190,7 +214,7 @@ update_reports() {
   local sweep_root="$1"
   {
     flock 202
-    python /disk/wangzhe/dllm/scripts/update_entropy_grid_reports.py \
+    python "${REPO_ROOT}/scripts/update_entropy_grid_reports.py" \
       --sweep-root "${sweep_root}"
   } 202>"${sweep_root}/.report.lock"
 }
@@ -226,7 +250,7 @@ run_grid_slice() {
 
     local model_args="pretrained=${MODEL_PATH},max_new_tokens=${GRID_MAX_NEW_TOKENS},steps=${GRID_STEPS},block_size=${GRID_BLOCK_SIZE},cfg_scale=${GRID_CFG_SCALE},suppress_tokens=[],begin_suppress_tokens=${GRID_BEGIN_SUPPRESS_TOKENS},enable_entropy_priority=True,enable_entropy_credit_scheduler=True,entropy_credit_rate=${credit_rate},entropy_warmup_ratio=${warmup_ratio},entropy_active_end_ratio=${active_end_ratio},entropy_end_ratio=${end_ratio},entropy_top_k=${GRID_ENTROPY_TOP_K},save_generation_records_path=${generation_records_path},save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True,diagnostic_collect_step_debug=True,diagnostic_log_interval=1"
     local -a command=(
-      accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval.py
+      accelerate launch --num_processes 1 "${REPO_ROOT}/dllm/pipelines/llada/eval.py"
       --tasks "${GRID_TASK}"
       --num_fewshot "${GRID_NUM_FEWSHOT}"
       --limit "${GRID_LIMIT}"

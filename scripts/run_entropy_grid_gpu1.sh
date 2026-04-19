@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source /disk/wangzhe/dllm/scripts/run_entropy_grid_common.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/run_entropy_grid_common.sh"
 
 ensure_environment
 require_model_path
