@@ -28,8 +28,9 @@ ensure_environment() {
     source "${HOME}/.zshrc"
   fi
 
-  if ! command -v conda >/dev/null 2>&1; then
+  if [[ "${CONDA_DEFAULT_ENV:-}" != "dllm" ]]; then
     local conda_candidate
+    local conda_loaded=0
     for conda_candidate in \
       "${HOME}/miniconda3/etc/profile.d/conda.sh" \
       "${HOME}/miniforge3/etc/profile.d/conda.sh" \
@@ -37,17 +38,19 @@ ensure_environment() {
       "/home/wangzhe/miniconda3/etc/profile.d/conda.sh"; do
       if [[ -f "${conda_candidate}" ]]; then
         source "${conda_candidate}"
+        conda_loaded=1
         break
       fi
     done
+
+    if [[ "${conda_loaded}" -ne 1 ]]; then
+      echo "Unable to locate conda.sh. Please initialize conda before running this script." >&2
+      exit 1
+    fi
+
+    conda activate dllm
   fi
 
-  if ! command -v conda >/dev/null 2>&1; then
-    echo "Unable to locate conda. Please initialize conda before running this script." >&2
-    exit 1
-  fi
-
-  conda activate dllm
   cd "${REPO_ROOT}"
   export PYTHONPATH=.:$PYTHONPATH
 }
