@@ -577,6 +577,9 @@ class TestMDLMSamplerExtensions:
         diagnostics = sampler._last_sampler_diagnostics
         # 4 steps * 0.4 credit => sparse trigger once instead of every step.
         assert diagnostics["entropy_trigger_count"] == 1
+        assert diagnostics["entropy_finalize_count"] == 1
+        assert diagnostics["baseline_finalize_count"] == 1
+        assert diagnostics["finalized_token_count"] == 2
 
     def test_structure_priority_can_enable_credit_candidate_selection(self):
         logits = torch.full((1, 3, 12), -8.0, dtype=torch.float32)
@@ -606,6 +609,7 @@ class TestMDLMSamplerExtensions:
         )
         diagnostics = sampler._last_sampler_diagnostics
         assert diagnostics["tentative_enter_count"] > 0
+        assert diagnostics["finalized_token_count"] >= diagnostics["tentative_finalize_count"]
 
     def test_infill_credit_scheduler_runs_tentative_path(self):
         logits = torch.full((1, 3, 12), -6.0, dtype=torch.float32)

@@ -31,10 +31,12 @@ class CaseRecord:
     entropy_priority_effective: bool
     entropy_trigger_count: int
     entropy_selected_token_count: int
+    entropy_finalize_count: int
     tentative_enter_count: int
     tentative_finalize_count: int
     tentative_rollback_count: int
     baseline_finalize_count: int
+    finalized_token_count: int
     token_event_count: int
     token_events: list[dict] | None
 
@@ -75,6 +77,9 @@ def _read_case_records(path: Path, include_token_events: bool) -> list[CaseRecor
                     entropy_selected_token_count=_safe_int(
                         diagnostics.get("entropy_selected_token_count", 0)
                     ),
+                    entropy_finalize_count=_safe_int(
+                        diagnostics.get("entropy_finalize_count", 0)
+                    ),
                     tentative_enter_count=_safe_int(
                         diagnostics.get("tentative_enter_count", 0)
                     ),
@@ -86,6 +91,9 @@ def _read_case_records(path: Path, include_token_events: bool) -> list[CaseRecor
                     ),
                     baseline_finalize_count=_safe_int(
                         diagnostics.get("baseline_finalize_count", 0)
+                    ),
+                    finalized_token_count=_safe_int(
+                        diagnostics.get("finalized_token_count", 0)
                     ),
                     token_event_count=len(token_events),
                     token_events=token_events if include_token_events else None,
@@ -105,10 +113,12 @@ def _write_compact_jsonl(records: list[CaseRecord], output_path: Path) -> None:
                 "entropy_priority_effective": record.entropy_priority_effective,
                 "entropy_trigger_count": record.entropy_trigger_count,
                 "entropy_selected_token_count": record.entropy_selected_token_count,
+                "entropy_finalize_count": record.entropy_finalize_count,
                 "tentative_enter_count": record.tentative_enter_count,
                 "tentative_finalize_count": record.tentative_finalize_count,
                 "tentative_rollback_count": record.tentative_rollback_count,
                 "baseline_finalize_count": record.baseline_finalize_count,
+                "finalized_token_count": record.finalized_token_count,
                 "token_event_count": record.token_event_count,
             }
             if record.token_events is not None:
@@ -126,10 +136,12 @@ def _write_csv(records: list[CaseRecord], output_path: Path) -> None:
                 "entropy_priority_effective",
                 "entropy_trigger_count",
                 "entropy_selected_token_count",
+                "entropy_finalize_count",
                 "tentative_enter_count",
                 "tentative_finalize_count",
                 "tentative_rollback_count",
                 "baseline_finalize_count",
+                "finalized_token_count",
                 "token_event_count",
                 "question",
                 "predicted_final_answer",
@@ -143,10 +155,12 @@ def _write_csv(records: list[CaseRecord], output_path: Path) -> None:
                     record.entropy_priority_effective,
                     record.entropy_trigger_count,
                     record.entropy_selected_token_count,
+                    record.entropy_finalize_count,
                     record.tentative_enter_count,
                     record.tentative_finalize_count,
                     record.tentative_rollback_count,
                     record.baseline_finalize_count,
+                    record.finalized_token_count,
                     record.token_event_count,
                     record.question,
                     record.predicted_final_answer,
@@ -162,8 +176,8 @@ def _build_summary(records: list[CaseRecord]) -> str:
     lines = [
         "# Entropy Priority Diagnostics Summary",
         "",
-        "| Source File | Cases | Effective Cases | Effective Ratio | Avg Trigger Count | Avg Selected Tokens | Avg Tentative Enter | Avg Tentative Finalize | Avg Tentative Rollback |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Source File | Cases | Effective Cases | Effective Ratio | Avg Trigger Count | Avg Selected Tokens | Avg Entropy Finalize | Avg Baseline Finalize | Avg Tentative Enter | Avg Tentative Finalize | Avg Tentative Rollback | Avg Finalized Tokens |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
 
     for source_file, source_records in sorted(grouped.items()):
@@ -173,6 +187,12 @@ def _build_summary(records: list[CaseRecord]) -> str:
         avg_selected = (
             sum(r.entropy_selected_token_count for r in source_records) / total
         )
+        avg_entropy_finalize = (
+            sum(r.entropy_finalize_count for r in source_records) / total
+        )
+        avg_baseline_finalize = (
+            sum(r.baseline_finalize_count for r in source_records) / total
+        )
         avg_enter = sum(r.tentative_enter_count for r in source_records) / total
         avg_finalize = (
             sum(r.tentative_finalize_count for r in source_records) / total
@@ -180,17 +200,23 @@ def _build_summary(records: list[CaseRecord]) -> str:
         avg_rollback = (
             sum(r.tentative_rollback_count for r in source_records) / total
         )
+        avg_total_finalize = (
+            sum(r.finalized_token_count for r in source_records) / total
+        )
         lines.append(
-            "| {source} | {total} | {effective} | {ratio:.3f} | {avg_trigger:.3f} | {avg_selected:.3f} | {avg_enter:.3f} | {avg_finalize:.3f} | {avg_rollback:.3f} |".format(
+            "| {source} | {total} | {effective} | {ratio:.3f} | {avg_trigger:.3f} | {avg_selected:.3f} | {avg_entropy_finalize:.3f} | {avg_baseline_finalize:.3f} | {avg_enter:.3f} | {avg_finalize:.3f} | {avg_rollback:.3f} | {avg_total_finalize:.3f} |".format(
                 source=source_file,
                 total=total,
                 effective=effective,
                 ratio=effective / total if total else 0.0,
                 avg_trigger=avg_trigger,
                 avg_selected=avg_selected,
+                avg_entropy_finalize=avg_entropy_finalize,
+                avg_baseline_finalize=avg_baseline_finalize,
                 avg_enter=avg_enter,
                 avg_finalize=avg_finalize,
                 avg_rollback=avg_rollback,
+                avg_total_finalize=avg_total_finalize,
             )
         )
 
@@ -202,6 +228,9 @@ def _build_summary(records: list[CaseRecord]) -> str:
             "- `Effective Cases` counts samples with `entropy_priority_effective=True`.",
             "- `Avg Trigger Count` is the mean number of entropy trigger events per sample.",
             "- `Avg Selected Tokens` is the mean number of tokens selected by entropy priority per sample.",
+            "- `Avg Entropy Finalize` counts entropy-selected tokens that were immediately finalized in the entropy-only path.",
+            "- `Avg Baseline Finalize` counts tokens finalized through the ordinary confidence path only.",
+            "- `Avg Finalized Tokens` is the total finalized token count per sample across entropy, baseline, and tentative finalize paths.",
             "- Tentative statistics are per-sample averages, useful for judging whether the entropy path only triggers or also survives to finalize.",
         ]
     )

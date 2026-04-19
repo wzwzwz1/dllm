@@ -392,9 +392,19 @@ CUDA_VISIBLE_DEVICES=2 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
 - `entropy_priority_effective`
 - `entropy_trigger_count`
 - `entropy_selected_token_count`
+- `entropy_finalize_count`
 - `tentative_enter_count`
 - `tentative_finalize_count`
 - `tentative_rollback_count`
+- `baseline_finalize_count`
+- `finalized_token_count`
+
+字段语义：
+- `entropy_selected_token_count`：被 entropy priority 选中的 token 数
+- `entropy_finalize_count`：被 entropy priority 选中后立即最终确定的 token 数，只会在 `entropy-only` 路径出现
+- `baseline_finalize_count`：走普通 confidence 路径最终确定的 token 数，不包含 entropy-only 的提前确定 token
+- `tentative_finalize_count`：先进入 tentative，随后最终 finalize 的 token 数
+- `finalized_token_count`：最终被确定的 token 总数，等于 `entropy_finalize_count + baseline_finalize_count + tentative_finalize_count`
 
 如果同时打开了 token 事件采集，还会有：
 

@@ -86,7 +86,9 @@ def _init_sampler_diagnostics(*, enabled: bool, collect_token_events: bool) -> d
         "tentative_enter_count": 0,
         "tentative_finalize_count": 0,
         "tentative_rollback_count": 0,
+        "entropy_finalize_count": 0,
         "baseline_finalize_count": 0,
+        "finalized_token_count": 0,
         "entropy_trigger_count": 0,
         "quota_conf_total": 0,
         "quota_tent_total": 0,
@@ -111,7 +113,9 @@ def _init_per_sample_diagnostics(
             "tentative_enter_count": 0,
             "tentative_finalize_count": 0,
             "tentative_rollback_count": 0,
+            "entropy_finalize_count": 0,
             "baseline_finalize_count": 0,
+            "finalized_token_count": 0,
         }
         if collect_token_events:
             entry["token_events"] = []
@@ -139,14 +143,19 @@ def _append_token_events(
                 sample_diag["entropy_priority_effective"] = True
                 sample_diag["entropy_trigger_count"] += 1
                 sample_diag["entropy_selected_token_count"] += 1
+            elif event_name == "entropy_finalize":
+                sample_diag["entropy_finalize_count"] += 1
+                sample_diag["finalized_token_count"] += 1
             elif event_name == "tentative_enter":
                 sample_diag["tentative_enter_count"] += 1
             elif event_name == "tentative_finalize":
                 sample_diag["tentative_finalize_count"] += 1
+                sample_diag["finalized_token_count"] += 1
             elif event_name == "tentative_rollback":
                 sample_diag["tentative_rollback_count"] += 1
             elif event_name == "baseline_finalize":
                 sample_diag["baseline_finalize_count"] += 1
+                sample_diag["finalized_token_count"] += 1
             if "token_events" in sample_diag:
                 sample_diag["token_events"].append(
                     {"event": event_name, "step": step_idx, "pos": pos_idx}
@@ -376,7 +385,9 @@ def _apply_extended_commit_strategy(
             tentative_last_margin,
         )
 
-        diagnostics["tentative_finalize_count"] += int(finalize_mask.sum().item())
+        finalized_count = int(finalize_mask.sum().item())
+        diagnostics["tentative_finalize_count"] += finalized_count
+        diagnostics["finalized_token_count"] += finalized_count
         diagnostics["tentative_rollback_count"] += int(rollback_mask.sum().item())
         released_this_step = finalize_mask | rollback_mask
         _append_token_events(
@@ -403,7 +414,9 @@ def _apply_extended_commit_strategy(
     )
     x[conf_transfer] = x0[conf_transfer]
     final_mask = final_mask | conf_transfer
-    diagnostics["baseline_finalize_count"] += int(conf_transfer.sum().item())
+    conf_finalized_count = int(conf_transfer.sum().item())
+    diagnostics["baseline_finalize_count"] += conf_finalized_count
+    diagnostics["finalized_token_count"] += conf_finalized_count
     diagnostics["quota_conf_total"] += int(conf_target_counts.sum().item())
     _append_token_events(
         diagnostics, event_name="baseline_finalize", event_mask=conf_transfer, step_idx=step_idx
@@ -906,12 +919,28 @@ class MDLMSampler(BaseSampler):
                         target_counts=confidence_counts,
                     )
                     x[transfer_index] = x0[transfer_index]
+                    entropy_finalized_count = int(entropy_transfer.sum().item())
+                    confidence_finalized_count = int(transfer_index.sum().item())
                     if enable_sampler_diagnostics:
-                        diagnostics["baseline_finalize_count"] += int(
-                            (transfer_index | entropy_transfer).sum().item()
+                        diagnostics["entropy_finalize_count"] += entropy_finalized_count
+                        diagnostics["baseline_finalize_count"] += confidence_finalized_count
+                        diagnostics["finalized_token_count"] += (
+                            entropy_finalized_count + confidence_finalized_count
                         )
                         diagnostics["quota_conf_total"] += int(
                             confidence_counts.sum().item()
+                        )
+                        _append_token_events(
+                            diagnostics,
+                            event_name="entropy_finalize",
+                            event_mask=entropy_transfer,
+                            step_idx=i,
+                        )
+                        _append_token_events(
+                            diagnostics,
+                            event_name="baseline_finalize",
+                            event_mask=transfer_index,
+                            step_idx=i,
                         )
                 global_step_idx += 1
                 if histories is not None:
@@ -1340,12 +1369,28 @@ class MDLMSampler(BaseSampler):
                         target_counts=confidence_counts,
                     )
                     x[transfer_index] = x0[transfer_index]
+                    entropy_finalized_count = int(entropy_transfer.sum().item())
+                    confidence_finalized_count = int(transfer_index.sum().item())
                     if enable_sampler_diagnostics:
-                        diagnostics["baseline_finalize_count"] += int(
-                            (transfer_index | entropy_transfer).sum().item()
+                        diagnostics["entropy_finalize_count"] += entropy_finalized_count
+                        diagnostics["baseline_finalize_count"] += confidence_finalized_count
+                        diagnostics["finalized_token_count"] += (
+                            entropy_finalized_count + confidence_finalized_count
                         )
                         diagnostics["quota_conf_total"] += int(
                             confidence_counts.sum().item()
+                        )
+                        _append_token_events(
+                            diagnostics,
+                            event_name="entropy_finalize",
+                            event_mask=entropy_transfer,
+                            step_idx=s,
+                        )
+                        _append_token_events(
+                            diagnostics,
+                            event_name="baseline_finalize",
+                            event_mask=transfer_index,
+                            step_idx=s,
                         )
                 global_step_idx += 1
                 if histories is not None:
