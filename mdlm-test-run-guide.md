@@ -180,8 +180,11 @@ python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --block_size 32 \
   --temperature 0.0 \
   --enable_entropy_priority True \
-  --entropy_min_tokens_per_step 1 \
-  --entropy_early_ratio 0.3 \
+  --enable_entropy_credit_scheduler True \
+  --entropy_credit_rate 0.35 \
+  --entropy_warmup_ratio 0.05 \
+  --entropy_active_end_ratio 0.20 \
+  --entropy_end_ratio 0.30 \
   --entropy_top_k 64
 ```
 
@@ -197,12 +200,14 @@ python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --block_size 32 \
   --temperature 0.0 \
   --enable_entropy_priority True \
+  --enable_entropy_credit_scheduler True \
   --enable_tentative_commit True \
   --enable_targeted_remask True \
-  --entropy_min_tokens_per_step 1 \
-  --entropy_early_ratio 0.3 \
+  --entropy_credit_rate 0.35 \
+  --entropy_warmup_ratio 0.05 \
+  --entropy_active_end_ratio 0.20 \
+  --entropy_end_ratio 0.30 \
   --entropy_top_k 64 \
-  --tentative_budget_ratio 0.1 \
   --tentative_min_hold_steps 1 \
   --tentative_stable_steps 2 \
   --tentative_max_hold_steps 3
@@ -220,12 +225,15 @@ python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --block_size 32 \
   --temperature 0.0 \
   --enable_entropy_priority True \
+  --enable_entropy_credit_scheduler True \
   --enable_tentative_commit True \
   --enable_targeted_remask True \
   --enable_structure_priority True \
   --enable_priority_age_bonus True \
-  --entropy_min_tokens_per_step 1 \
-  --entropy_early_ratio 0.3 \
+  --entropy_credit_rate 0.35 \
+  --entropy_warmup_ratio 0.05 \
+  --entropy_active_end_ratio 0.20 \
+  --entropy_end_ratio 0.30 \
   --entropy_top_k 64 \
   --structure_prior_mode token_type_with_context \
   --structure_prior_strength 1.0
@@ -256,16 +264,23 @@ mkdir -p /disk/wangzhe/dllm/.logs
 - `max_new_tokens=512`
 - `steps=64`
 - `block_size=32`
-- `entropy_early_ratio=0.2`
-- `tentative_budget_ratio=0.25`
+- `entropy_credit_rate=0.35`
+- `entropy_warmup_ratio=0.05`
+- `entropy_active_end_ratio=0.20`
+- `entropy_end_ratio=0.30`
 
 原因：
 
-- `steps=512` 会让每步预算过碎，tentative 配额容易长期被 floor 成 `0`
-- `steps=64` 可以显著加快评测，同时让 tentative 通道真正参与
+- 新实现不再使用“每步固定至少处理几个 entropy token”，而是用 `credit` 稀疏触发
+- `steps=64` 可以显著加快评测，同时让 entropy credit 和 tentative 通道真正参与
 - `block_size=32` 先保持不变，避免一次改太多变量
-- `entropy_early_ratio=0.2` 比 `0.3` 更保守，适合先做稳定对照
-- `tentative_budget_ratio=0.25` 能明显提高 `gpu2/gpu3` 两组的有效介入概率
+- `0.05 / 0.20 / 0.30` 这组 phase 配置对应 warmup / active / cooldown / off，适合作为中等触发默认值
+- `entropy_credit_rate=0.35` 大致会形成“不是每步都触发，但前期会稳定插入 entropy 名额”的节奏
+
+补充说明：
+
+- `entropy_min_tokens_per_step` 和 `tentative_budget_ratio` 现在只保留作兼容字段，不再决定主逻辑
+- 新实验请优先调 `entropy_credit_rate`、`entropy_warmup_ratio`、`entropy_active_end_ratio`、`entropy_end_ratio`
 
 ### 9.1 Baseline：`gsm8k_cot --limit 20`
 
@@ -281,7 +296,7 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],entropy_min_tokens_per_step=0,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-baseline-gpu0.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-baseline-gpu0.log
 ```
 
@@ -294,7 +309,7 @@ CUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.2,entropy_top_k=64" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-entropy-only-gpu1.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-entropy-only-gpu1.log
 ```
 
@@ -307,7 +322,7 @@ CUDA_VISIBLE_DEVICES=2 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.2,entropy_top_k=64,tentative_budget_ratio=0.25,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.log
 ```
 
@@ -320,7 +335,7 @@ CUDA_VISIBLE_DEVICES=3 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.2,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.25,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3" \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-structure-priority-gpu3.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True" \
   2>&1 | tee /disk/wangzhe/dllm/.logs/gsm8k-structure-priority-gpu3.log
 ```
 
@@ -331,6 +346,42 @@ CUDA_VISIBLE_DEVICES=3 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dl
 ```bash
 mkdir -p /disk/wangzhe/dllm/.logs
 ```
+
+如果你希望在评测时除了标准输出日志之外，再额外保存：
+
+- 题目内容
+- 完整 prompt
+- 模型回答
+- 启发式提取出的最终答案
+- 可选的 step 级文本轨迹
+
+现在可以直接在 `model_args` 中加入下面这些参数：
+
+- `save_generation_records_path=/disk/wangzhe/dllm/.logs/xxx.jsonl`
+- `save_generation_traces=True`
+- `generation_trace_max_steps=64`
+- `save_sampler_diagnostics=True`
+
+例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval.py \
+  --tasks gsm8k_cot \
+  --num_fewshot 5 \
+  --limit 20 \
+  --model llada \
+  --apply_chat_template \
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3,save_generation_records_path=/disk/wangzhe/dllm/.logs/gsm8k-tentative-remask-gpu2.jsonl,save_generation_traces=True,generation_trace_max_steps=64,save_sampler_diagnostics=True"
+```
+
+生成的 `jsonl` 文件中，每一行对应一道题，包含：
+
+- `question`
+- `prompt`
+- `response`
+- `predicted_final_answer`
+- `generation_trace`
+- `sampler_diagnostics`（如果开启）
 
 例如把关键单测结果保存下来：
 
@@ -351,10 +402,13 @@ python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --block_size 32 \
   --temperature 0.0 \
   --enable_entropy_priority True \
+  --enable_entropy_credit_scheduler True \
   --enable_tentative_commit True \
   --enable_targeted_remask True \
-  --entropy_min_tokens_per_step 1 \
-  --entropy_early_ratio 0.3 \
+  --entropy_credit_rate 0.35 \
+  --entropy_warmup_ratio 0.05 \
+  --entropy_active_end_ratio 0.20 \
+  --entropy_end_ratio 0.30 \
   --entropy_top_k 64 \
   2>&1 | tee /disk/wangzhe/dllm/.logs/mdlm-sample-tentative-remask.log
 ```
@@ -402,12 +456,15 @@ python -u /disk/wangzhe/dllm/examples/llada/sample.py \
   --block_size 32 \
   --temperature 0.0 \
   --enable_entropy_priority True \
+  --enable_entropy_credit_scheduler True \
   --enable_tentative_commit True \
   --enable_targeted_remask True \
   --enable_structure_priority True \
   --enable_priority_age_bonus True \
-  --entropy_min_tokens_per_step 1 \
-  --entropy_early_ratio 0.3 \
+  --entropy_credit_rate 0.35 \
+  --entropy_warmup_ratio 0.05 \
+  --entropy_active_end_ratio 0.20 \
+  --entropy_end_ratio 0.30 \
   --entropy_top_k 64 \
   --structure_prior_mode token_type_with_context
 
@@ -425,7 +482,7 @@ accelerate launch --num_processes 1 /disk/wangzhe/dllm/dllm/pipelines/llada/eval
   --limit 20 \
   --model llada \
   --apply_chat_template \
-  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_min_tokens_per_step=1,entropy_early_ratio=0.2,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_budget_ratio=0.25,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3"
+  --model_args "pretrained=$MODEL_PATH,max_new_tokens=512,steps=64,block_size=32,cfg_scale=0.0,suppress_tokens=[],begin_suppress_tokens=[126081;126348],enable_entropy_priority=True,enable_entropy_credit_scheduler=True,enable_tentative_commit=True,enable_targeted_remask=True,enable_structure_priority=True,enable_priority_age_bonus=True,entropy_credit_rate=0.35,entropy_warmup_ratio=0.05,entropy_active_end_ratio=0.20,entropy_end_ratio=0.30,entropy_top_k=64,structure_prior_mode=token_type_with_context,structure_prior_strength=1.0,tentative_min_hold_steps=1,tentative_stable_steps=2,tentative_max_hold_steps=3"
 ```
 
 如果这几步都正常，再继续做更大的 benchmark。

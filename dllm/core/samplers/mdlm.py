@@ -14,12 +14,16 @@ from dllm.core.samplers.utils import (
     add_gumbel_noise,
     build_priority_scores,
     build_structure_prior_scores,
+    compute_entropy_phase_scale,
+    compute_entropy_trigger_counts,
     compute_tentative_finalize_mask,
     compute_tentative_rollback_mask,
     get_num_transfer_tokens,
     get_top1_margin,
     get_token_entropy,
+    select_entropy_candidate_mask,
     select_transfer_positions,
+    update_entropy_credit,
     update_tentative_stats,
 )
 
@@ -46,10 +50,20 @@ class MDLMSamplerConfig(BaseSamplerConfig):
     enable_structure_priority: bool = False
     enable_priority_age_bonus: bool = False
     enable_sampler_diagnostics: bool = False
+    enable_entropy_credit_scheduler: bool = True
     entropy_min_tokens_per_step: int = 0
     entropy_early_ratio: float = 0.3
     entropy_top_k: int | None = None
     tentative_budget_ratio: float = 0.1
+    entropy_credit_rate: float = 0.35
+    entropy_warmup_ratio: float = 0.05
+    entropy_active_end_ratio: float = 0.20
+    entropy_end_ratio: float = 0.30
+    entropy_max_trigger_per_step: int = 1
+    entropy_use_quality_gate: bool = True
+    entropy_conf_floor: float = 0.15
+    entropy_age_threshold: int = 2
+    entropy_top_candidate_pool: int = 4
     tentative_min_hold_steps: int = 1
     tentative_stable_steps: int = 2
     tentative_max_hold_steps: int = 3
@@ -73,6 +87,7 @@ def _init_sampler_diagnostics(*, enabled: bool, collect_token_events: bool) -> d
         "tentative_finalize_count": 0,
         "tentative_rollback_count": 0,
         "baseline_finalize_count": 0,
+        "entropy_trigger_count": 0,
         "quota_conf_total": 0,
         "quota_tent_total": 0,
     }
@@ -105,16 +120,116 @@ def _clear_positions(
     )
 
 
+def _compute_entropy_trigger_plan(
+    *,
+    tokenizer,
+    x: torch.Tensor,
+    x0: torch.Tensor,
+    confidence: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    deferred_age: torch.Tensor,
+    total_budget: torch.Tensor,
+    entropy_credit: torch.Tensor,
+    step_ratio: float,
+    enable_entropy_priority: bool,
+    enable_entropy_credit_scheduler: bool,
+    enable_structure_priority: bool,
+    enable_priority_age_bonus: bool,
+    entropy_top_k: int | None,
+    entropy_credit_rate: float,
+    entropy_warmup_ratio: float,
+    entropy_active_end_ratio: float,
+    entropy_end_ratio: float,
+    entropy_max_trigger_per_step: int,
+    entropy_use_quality_gate: bool,
+    entropy_conf_floor: float,
+    entropy_age_threshold: int,
+    entropy_top_candidate_pool: int,
+    priority_entropy_weight: float,
+    priority_structure_weight: float,
+    priority_age_weight: float,
+    priority_confidence_weight: float,
+    structure_prior_mode: str,
+    structure_prior_strength: float,
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    zero_counts = torch.zeros_like(total_budget, dtype=torch.long)
+    zero_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+    if not enable_entropy_priority or not enable_entropy_credit_scheduler:
+        return None, entropy_credit, zero_counts, zero_mask
+
+    phase_scale = compute_entropy_phase_scale(
+        step_ratio,
+        entropy_warmup_ratio,
+        entropy_active_end_ratio,
+        entropy_end_ratio,
+    )
+    if phase_scale <= 0:
+        return None, entropy_credit, zero_counts, zero_mask
+
+    entropy_scores = get_token_entropy(logits, top_k=entropy_top_k)
+    entropy_credit = update_entropy_credit(
+        entropy_credit,
+        phase_scale=phase_scale,
+        credit_rate=entropy_credit_rate,
+    )
+
+    structure_scores = build_structure_prior_scores(
+        tokenizer,
+        x0,
+        candidate_mask,
+        structure_prior_mode if enable_structure_priority else "none",
+        structure_prior_strength,
+        context_tokens=x,
+    )
+    age_scores = (
+        deferred_age.to(torch.float32)
+        if enable_priority_age_bonus
+        else torch.zeros_like(confidence, dtype=torch.float32)
+    )
+    priority_scores = build_priority_scores(
+        entropy_scores,
+        confidence=confidence,
+        structure_scores=structure_scores,
+        age_scores=age_scores,
+        entropy_weight=priority_entropy_weight,
+        structure_weight=priority_structure_weight,
+        age_weight=priority_age_weight,
+        confidence_weight=priority_confidence_weight,
+    )
+    entropy_candidate_mask = select_entropy_candidate_mask(
+        priority_scores=priority_scores,
+        candidate_mask=candidate_mask,
+        structure_scores=structure_scores,
+        age_scores=age_scores,
+        confidence=confidence,
+        top_candidate_pool=entropy_top_candidate_pool,
+        use_quality_gate=entropy_use_quality_gate,
+        confidence_floor=entropy_conf_floor,
+        age_threshold=entropy_age_threshold,
+    )
+    trigger_counts = compute_entropy_trigger_counts(
+        entropy_credit,
+        candidate_exists=entropy_candidate_mask.any(dim=1),
+        max_trigger_per_step=entropy_max_trigger_per_step,
+    )
+    trigger_counts = torch.minimum(trigger_counts, total_budget.to(torch.long))
+    entropy_candidate_mask = entropy_candidate_mask & trigger_counts.unsqueeze(1).bool()
+    entropy_credit = entropy_credit - trigger_counts.to(entropy_credit.dtype)
+    return entropy_scores, entropy_credit, trigger_counts, entropy_candidate_mask
+
+
 def _apply_extended_commit_strategy(
     *,
     tokenizer,
     x: torch.Tensor,
     x0: torch.Tensor,
     confidence: torch.Tensor,
-    entropy_scores: torch.Tensor | None,
     margin_scores: torch.Tensor,
     candidate_mask: torch.Tensor,
-    total_budget: torch.Tensor,
+    conf_target_counts: torch.Tensor,
+    tentative_target_counts: torch.Tensor,
+    tentative_candidate_mask: torch.Tensor,
     step_idx: int,
     mask_id: int,
     final_mask: torch.Tensor,
@@ -127,12 +242,8 @@ def _apply_extended_commit_strategy(
     tentative_stable_run: torch.Tensor,
     tentative_last_conf: torch.Tensor,
     tentative_last_margin: torch.Tensor,
-    enable_entropy_priority: bool,
     enable_tentative_commit: bool,
     enable_targeted_remask: bool,
-    enable_structure_priority: bool,
-    enable_priority_age_bonus: bool,
-    tentative_budget_ratio: float,
     tentative_min_hold_steps: int,
     tentative_stable_steps: int,
     tentative_max_hold_steps: int,
@@ -140,12 +251,6 @@ def _apply_extended_commit_strategy(
     tentative_final_margin_thresh: float,
     remask_rollback_prob_thresh: float,
     remask_flip_thresh: int,
-    priority_entropy_weight: float,
-    priority_structure_weight: float,
-    priority_age_weight: float,
-    priority_confidence_weight: float,
-    structure_prior_mode: str,
-    structure_prior_strength: float,
     diagnostics: dict,
 ) -> tuple[torch.Tensor, ...]:
     released_this_step = torch.zeros_like(candidate_mask)
@@ -246,60 +351,26 @@ def _apply_extended_commit_strategy(
         & ~final_mask
         & ~released_this_step
     )
-    k_tent = torch.zeros_like(total_budget)
-    if enable_entropy_priority and enable_tentative_commit and tentative_budget_ratio > 0:
-        k_tent = torch.floor(
-            total_budget.to(torch.float32) * float(tentative_budget_ratio)
-        ).to(torch.long)
-        k_tent = torch.minimum(k_tent, remaining_mask.sum(dim=1).to(torch.long))
 
-    k_conf = torch.clamp(total_budget.to(torch.long) - k_tent, min=0)
+    reserved_tentative = tentative_candidate_mask & remaining_mask
+    conf_mask = remaining_mask & ~reserved_tentative
     conf_transfer = select_transfer_positions(
         confidence=confidence,
-        mask_index=remaining_mask,
-        target_counts=k_conf,
+        mask_index=conf_mask,
+        target_counts=conf_target_counts.to(torch.long),
     )
     x[conf_transfer] = x0[conf_transfer]
     final_mask = final_mask | conf_transfer
     diagnostics["baseline_finalize_count"] += int(conf_transfer.sum().item())
-    diagnostics["quota_conf_total"] += int(k_conf.sum().item())
+    diagnostics["quota_conf_total"] += int(conf_target_counts.sum().item())
     _append_token_events(
         diagnostics, event_name="baseline_finalize", event_mask=conf_transfer, step_idx=step_idx
     )
 
     remaining_mask = remaining_mask & ~conf_transfer
 
-    if k_tent.any():
-        structure_scores = build_structure_prior_scores(
-            tokenizer,
-            x0,
-            remaining_mask,
-            structure_prior_mode if enable_structure_priority else "none",
-            structure_prior_strength,
-            context_tokens=x,
-        )
-        age_scores = (
-            deferred_age.to(torch.float32)
-            if enable_priority_age_bonus
-            else torch.zeros_like(confidence, dtype=torch.float32)
-        )
-        priority_scores = build_priority_scores(
-            entropy_scores
-            if entropy_scores is not None
-            else torch.zeros_like(confidence, dtype=torch.float32),
-            confidence=confidence,
-            structure_scores=structure_scores,
-            age_scores=age_scores,
-            entropy_weight=priority_entropy_weight,
-            structure_weight=priority_structure_weight,
-            age_weight=priority_age_weight,
-            confidence_weight=priority_confidence_weight,
-        )
-        tentative_transfer = select_transfer_positions(
-            confidence=priority_scores,
-            mask_index=remaining_mask,
-            target_counts=k_tent,
-        )
+    if enable_tentative_commit and tentative_target_counts.any():
+        tentative_transfer = reserved_tentative & remaining_mask
         x[tentative_transfer] = x0[tentative_transfer]
         tentative_mask = tentative_mask | tentative_transfer
         tentative_token_ids = torch.where(
@@ -328,7 +399,7 @@ def _apply_extended_commit_strategy(
             tentative_transfer, margin_scores, tentative_last_margin
         )
         diagnostics["tentative_enter_count"] += int(tentative_transfer.sum().item())
-        diagnostics["quota_tent_total"] += int(k_tent.sum().item())
+        diagnostics["quota_tent_total"] += int(tentative_target_counts.sum().item())
         _append_token_events(
             diagnostics,
             event_name="tentative_enter",
@@ -385,7 +456,7 @@ class MDLMSampler(BaseSampler):
             config = MDLMSamplerConfig()
 
         # ----- pull args from config, allow kwargs to override -----
-        steps = kwargs.get("steps", config.steps)
+        requested_steps = kwargs.get("steps", config.steps)
         max_new_tokens = kwargs.get("max_new_tokens", config.max_new_tokens)
         max_length = kwargs.get("max_length", config.max_length)
         block_size = kwargs.get("block_size", config.block_size)
@@ -409,6 +480,36 @@ class MDLMSampler(BaseSampler):
             "entropy_early_ratio", config.entropy_early_ratio
         )
         entropy_top_k = kwargs.get("entropy_top_k", config.entropy_top_k)
+        enable_entropy_credit_scheduler = kwargs.get(
+            "enable_entropy_credit_scheduler", config.enable_entropy_credit_scheduler
+        )
+        entropy_credit_rate = kwargs.get(
+            "entropy_credit_rate", config.entropy_credit_rate
+        )
+        entropy_warmup_ratio = kwargs.get(
+            "entropy_warmup_ratio", config.entropy_warmup_ratio
+        )
+        entropy_active_end_ratio = kwargs.get(
+            "entropy_active_end_ratio", config.entropy_active_end_ratio
+        )
+        entropy_end_ratio = kwargs.get(
+            "entropy_end_ratio", config.entropy_end_ratio
+        )
+        entropy_max_trigger_per_step = kwargs.get(
+            "entropy_max_trigger_per_step", config.entropy_max_trigger_per_step
+        )
+        entropy_use_quality_gate = kwargs.get(
+            "entropy_use_quality_gate", config.entropy_use_quality_gate
+        )
+        entropy_conf_floor = kwargs.get(
+            "entropy_conf_floor", config.entropy_conf_floor
+        )
+        entropy_age_threshold = kwargs.get(
+            "entropy_age_threshold", config.entropy_age_threshold
+        )
+        entropy_top_candidate_pool = kwargs.get(
+            "entropy_top_candidate_pool", config.entropy_top_candidate_pool
+        )
         enable_entropy_priority = kwargs.get(
             "enable_entropy_priority", config.enable_entropy_priority
         )
@@ -474,7 +575,7 @@ class MDLMSampler(BaseSampler):
         )
 
         assert 1 <= block_size
-        assert 1 <= steps
+        assert 1 <= requested_steps
         mask_id = self.tokenizer.mask_token_id
         bos_id = self.tokenizer.bos_token_id
         eos_id = self.tokenizer.eos_token_id
@@ -525,20 +626,16 @@ class MDLMSampler(BaseSampler):
 
         # ----- Block scheduling over the appended mask tail -----
         num_blocks = math.ceil(max_new_tokens / block_size)
-        steps = math.ceil(steps / num_blocks)  # per-block step budget
+        steps_per_block = math.ceil(requested_steps / num_blocks)
+        total_planned_steps = steps_per_block * num_blocks
         histories = [x.clone()] if return_dict else None
         diagnostics = _init_sampler_diagnostics(
             enabled=enable_sampler_diagnostics,
             collect_token_events=diagnostic_collect_token_events,
         )
-        use_tentative_features = any(
-            (
-                enable_tentative_commit,
-                enable_targeted_remask,
-                enable_structure_priority,
-                enable_priority_age_bonus,
-            )
-        )
+        entropy_credit = torch.zeros((B,), device=x.device, dtype=torch.float32)
+        global_step_idx = 0
+        use_tentative_features = enable_tentative_commit
         if use_tentative_features:
             final_mask = (x != mask_id) & attention_mask.bool()
             tentative_mask = torch.zeros_like(final_mask)
@@ -569,18 +666,11 @@ class MDLMSampler(BaseSampler):
             # Decide how many tokens to reveal per step in this block
             num_transfer_tokens = get_num_transfer_tokens(
                 mask_index=block_mask_index,
-                steps=steps,
+                steps=steps_per_block,
                 scheduler=self.scheduler,
                 stochastic=stochastic_transfer,
             )
-
-            # Some steps may be skipped if there are no transfers
             effective_steps = num_transfer_tokens.size(1)
-            entropy_guided_steps = (
-                math.ceil(effective_steps * entropy_early_ratio)
-                if enable_entropy_priority and entropy_min_tokens_per_step > 0
-                else 0
-            )
 
             # ----- Iterative reveal inside the current block -----
             for i in range(effective_steps):
@@ -648,11 +738,62 @@ class MDLMSampler(BaseSampler):
                     torch.zeros_like(confidence, dtype=torch.float32),
                 )
 
-                entropy_scores = None
-                if i < entropy_guided_steps:
-                    entropy_scores = get_token_entropy(logits, top_k=entropy_top_k)
+                step_ratio = (
+                    global_step_idx / total_planned_steps
+                    if total_planned_steps > 0
+                    else 0.0
+                )
+                (
+                    entropy_scores,
+                    entropy_credit,
+                    entropy_trigger_counts,
+                    entropy_candidate_mask,
+                ) = _compute_entropy_trigger_plan(
+                    tokenizer=self.tokenizer,
+                    x=x,
+                    x0=x0,
+                    confidence=confidence,
+                    candidate_mask=candidate_mask,
+                    deferred_age=deferred_age if use_tentative_features else torch.zeros_like(x, dtype=torch.long),
+                    total_budget=num_transfer_tokens[:, i],
+                    entropy_credit=entropy_credit,
+                    step_ratio=step_ratio,
+                    enable_entropy_priority=enable_entropy_priority,
+                    enable_entropy_credit_scheduler=enable_entropy_credit_scheduler,
+                    enable_structure_priority=enable_structure_priority,
+                    enable_priority_age_bonus=enable_priority_age_bonus,
+                    entropy_top_k=entropy_top_k,
+                    entropy_credit_rate=entropy_credit_rate,
+                    entropy_warmup_ratio=entropy_warmup_ratio,
+                    entropy_active_end_ratio=entropy_active_end_ratio,
+                    entropy_end_ratio=entropy_end_ratio,
+                    entropy_max_trigger_per_step=entropy_max_trigger_per_step,
+                    entropy_use_quality_gate=entropy_use_quality_gate,
+                    entropy_conf_floor=entropy_conf_floor,
+                    entropy_age_threshold=entropy_age_threshold,
+                    entropy_top_candidate_pool=entropy_top_candidate_pool,
+                    priority_entropy_weight=priority_entropy_weight,
+                    priority_structure_weight=priority_structure_weight,
+                    priority_age_weight=priority_age_weight,
+                    priority_confidence_weight=priority_confidence_weight,
+                    structure_prior_mode=structure_prior_mode,
+                    structure_prior_strength=structure_prior_strength,
+                    logits=logits,
+                )
+                diagnostics["entropy_trigger_count"] += int(
+                    entropy_trigger_counts.sum().item()
+                )
 
                 if use_tentative_features:
+                    conf_target_counts = torch.clamp(
+                        num_transfer_tokens[:, i].to(torch.long) - entropy_trigger_counts,
+                        min=0,
+                    )
+                    tentative_target_counts = (
+                        entropy_trigger_counts
+                        if enable_tentative_commit
+                        else torch.zeros_like(entropy_trigger_counts)
+                    )
                     (
                         x,
                         final_mask,
@@ -670,10 +811,11 @@ class MDLMSampler(BaseSampler):
                         x=x,
                         x0=x0,
                         confidence=confidence,
-                        entropy_scores=entropy_scores,
                         margin_scores=margin_scores,
                         candidate_mask=candidate_mask,
-                        total_budget=num_transfer_tokens[:, i],
+                        conf_target_counts=conf_target_counts,
+                        tentative_target_counts=tentative_target_counts,
+                        tentative_candidate_mask=entropy_candidate_mask,
                         step_idx=i,
                         mask_id=mask_id,
                         final_mask=final_mask,
@@ -686,12 +828,8 @@ class MDLMSampler(BaseSampler):
                         tentative_stable_run=tentative_stable_run,
                         tentative_last_conf=tentative_last_conf,
                         tentative_last_margin=tentative_last_margin,
-                        enable_entropy_priority=enable_entropy_priority and i < entropy_guided_steps,
                         enable_tentative_commit=enable_tentative_commit,
                         enable_targeted_remask=enable_targeted_remask,
-                        enable_structure_priority=enable_structure_priority,
-                        enable_priority_age_bonus=enable_priority_age_bonus,
-                        tentative_budget_ratio=tentative_budget_ratio,
                         tentative_min_hold_steps=tentative_min_hold_steps,
                         tentative_stable_steps=tentative_stable_steps,
                         tentative_max_hold_steps=tentative_max_hold_steps,
@@ -699,32 +837,30 @@ class MDLMSampler(BaseSampler):
                         tentative_final_margin_thresh=tentative_final_margin_thresh,
                         remask_rollback_prob_thresh=remask_rollback_prob_thresh,
                         remask_flip_thresh=remask_flip_thresh,
-                        priority_entropy_weight=priority_entropy_weight,
-                        priority_structure_weight=priority_structure_weight,
-                        priority_age_weight=priority_age_weight,
-                        priority_confidence_weight=priority_confidence_weight,
-                        structure_prior_mode=structure_prior_mode,
-                        structure_prior_strength=structure_prior_strength,
                         diagnostics=diagnostics,
                     )
                 else:
+                    entropy_transfer = entropy_candidate_mask
+                    x[entropy_transfer] = x0[entropy_transfer]
+                    confidence_mask = candidate_mask & ~entropy_transfer
+                    confidence_counts = torch.clamp(
+                        num_transfer_tokens[:, i].to(torch.long) - entropy_trigger_counts,
+                        min=0,
+                    )
                     transfer_index = select_transfer_positions(
                         confidence=confidence,
-                        mask_index=candidate_mask,
-                        target_counts=num_transfer_tokens[:, i],
-                        entropy_scores=entropy_scores if enable_entropy_priority else None,
-                        entropy_first_k=(
-                            entropy_min_tokens_per_step if enable_entropy_priority else 0
-                        ),
+                        mask_index=confidence_mask,
+                        target_counts=confidence_counts,
                     )
                     x[transfer_index] = x0[transfer_index]
                     if enable_sampler_diagnostics:
                         diagnostics["baseline_finalize_count"] += int(
-                            transfer_index.sum().item()
+                            (transfer_index | entropy_transfer).sum().item()
                         )
                         diagnostics["quota_conf_total"] += int(
-                            num_transfer_tokens[:, i].sum().item()
+                            confidence_counts.sum().item()
                         )
+                global_step_idx += 1
                 if histories is not None:
                     histories.append(x.clone())
 
@@ -752,7 +888,7 @@ class MDLMSampler(BaseSampler):
         - Only masked positions are ever updated; non-mask tokens are left intact.
         """
         # ----- pull args from config, allow kwargs to override -----
-        steps = kwargs.get("steps", config.steps)
+        requested_steps = kwargs.get("steps", config.steps)
         block_size = kwargs.get("block_size", config.block_size)
         temperature = kwargs.get("temperature", config.temperature)
         cfg_scale = kwargs.get("cfg_scale", config.cfg_scale)
@@ -774,6 +910,36 @@ class MDLMSampler(BaseSampler):
             "entropy_early_ratio", config.entropy_early_ratio
         )
         entropy_top_k = kwargs.get("entropy_top_k", config.entropy_top_k)
+        enable_entropy_credit_scheduler = kwargs.get(
+            "enable_entropy_credit_scheduler", config.enable_entropy_credit_scheduler
+        )
+        entropy_credit_rate = kwargs.get(
+            "entropy_credit_rate", config.entropy_credit_rate
+        )
+        entropy_warmup_ratio = kwargs.get(
+            "entropy_warmup_ratio", config.entropy_warmup_ratio
+        )
+        entropy_active_end_ratio = kwargs.get(
+            "entropy_active_end_ratio", config.entropy_active_end_ratio
+        )
+        entropy_end_ratio = kwargs.get(
+            "entropy_end_ratio", config.entropy_end_ratio
+        )
+        entropy_max_trigger_per_step = kwargs.get(
+            "entropy_max_trigger_per_step", config.entropy_max_trigger_per_step
+        )
+        entropy_use_quality_gate = kwargs.get(
+            "entropy_use_quality_gate", config.entropy_use_quality_gate
+        )
+        entropy_conf_floor = kwargs.get(
+            "entropy_conf_floor", config.entropy_conf_floor
+        )
+        entropy_age_threshold = kwargs.get(
+            "entropy_age_threshold", config.entropy_age_threshold
+        )
+        entropy_top_candidate_pool = kwargs.get(
+            "entropy_top_candidate_pool", config.entropy_top_candidate_pool
+        )
         enable_entropy_priority = kwargs.get(
             "enable_entropy_priority", config.enable_entropy_priority
         )
@@ -864,7 +1030,7 @@ class MDLMSampler(BaseSampler):
             block_size = T
 
         assert 1 <= block_size
-        assert 1 <= steps
+        assert 1 <= requested_steps
 
         x = torch.full((B, T), eos_id, dtype=torch.long, device=self.model.device)
         for i, t in enumerate(inputs):
@@ -887,20 +1053,16 @@ class MDLMSampler(BaseSampler):
 
         # ----- Blockwise schedule over the *entire* (padded) sequence -----
         num_blocks = math.ceil(T / block_size)
-        steps_per_block = math.ceil(steps / num_blocks)
+        steps_per_block = math.ceil(requested_steps / num_blocks)
+        total_planned_steps = steps_per_block * num_blocks
         histories = [x.clone()] if return_dict else None
         diagnostics = _init_sampler_diagnostics(
             enabled=enable_sampler_diagnostics,
             collect_token_events=diagnostic_collect_token_events,
         )
-        use_tentative_features = any(
-            (
-                enable_tentative_commit,
-                enable_targeted_remask,
-                enable_structure_priority,
-                enable_priority_age_bonus,
-            )
-        )
+        entropy_credit = torch.zeros((B,), device=x.device, dtype=torch.float32)
+        global_step_idx = 0
+        use_tentative_features = enable_tentative_commit
         if use_tentative_features:
             final_mask = (x != mask_id) & attention_mask.bool()
             tentative_mask = torch.zeros_like(final_mask)
@@ -937,13 +1099,7 @@ class MDLMSampler(BaseSampler):
                 stochastic=stochastic_transfer,
             )
 
-            # Some blocks may have no masks => effective_steps == 0
             effective_steps = num_transfer_tokens.size(1)
-            entropy_guided_steps = (
-                math.ceil(effective_steps * entropy_early_ratio)
-                if enable_entropy_priority and entropy_min_tokens_per_step > 0
-                else 0
-            )
 
             for s in range(effective_steps):
                 mask_index_full = x == mask_id
@@ -1005,11 +1161,62 @@ class MDLMSampler(BaseSampler):
                     torch.zeros_like(confidence, dtype=torch.float32),
                 )
 
-                entropy_scores = None
-                if s < entropy_guided_steps:
-                    entropy_scores = get_token_entropy(logits, top_k=entropy_top_k)
+                step_ratio = (
+                    global_step_idx / total_planned_steps
+                    if total_planned_steps > 0
+                    else 0.0
+                )
+                (
+                    entropy_scores,
+                    entropy_credit,
+                    entropy_trigger_counts,
+                    entropy_candidate_mask,
+                ) = _compute_entropy_trigger_plan(
+                    tokenizer=self.tokenizer,
+                    x=x,
+                    x0=x0,
+                    confidence=confidence,
+                    candidate_mask=candidate_mask,
+                    deferred_age=deferred_age if use_tentative_features else torch.zeros_like(x, dtype=torch.long),
+                    total_budget=num_transfer_tokens[:, s],
+                    entropy_credit=entropy_credit,
+                    step_ratio=step_ratio,
+                    enable_entropy_priority=enable_entropy_priority,
+                    enable_entropy_credit_scheduler=enable_entropy_credit_scheduler,
+                    enable_structure_priority=enable_structure_priority,
+                    enable_priority_age_bonus=enable_priority_age_bonus,
+                    entropy_top_k=entropy_top_k,
+                    entropy_credit_rate=entropy_credit_rate,
+                    entropy_warmup_ratio=entropy_warmup_ratio,
+                    entropy_active_end_ratio=entropy_active_end_ratio,
+                    entropy_end_ratio=entropy_end_ratio,
+                    entropy_max_trigger_per_step=entropy_max_trigger_per_step,
+                    entropy_use_quality_gate=entropy_use_quality_gate,
+                    entropy_conf_floor=entropy_conf_floor,
+                    entropy_age_threshold=entropy_age_threshold,
+                    entropy_top_candidate_pool=entropy_top_candidate_pool,
+                    priority_entropy_weight=priority_entropy_weight,
+                    priority_structure_weight=priority_structure_weight,
+                    priority_age_weight=priority_age_weight,
+                    priority_confidence_weight=priority_confidence_weight,
+                    structure_prior_mode=structure_prior_mode,
+                    structure_prior_strength=structure_prior_strength,
+                    logits=logits,
+                )
+                diagnostics["entropy_trigger_count"] += int(
+                    entropy_trigger_counts.sum().item()
+                )
 
                 if use_tentative_features:
+                    conf_target_counts = torch.clamp(
+                        num_transfer_tokens[:, s].to(torch.long) - entropy_trigger_counts,
+                        min=0,
+                    )
+                    tentative_target_counts = (
+                        entropy_trigger_counts
+                        if enable_tentative_commit
+                        else torch.zeros_like(entropy_trigger_counts)
+                    )
                     (
                         x,
                         final_mask,
@@ -1027,10 +1234,11 @@ class MDLMSampler(BaseSampler):
                         x=x,
                         x0=x0,
                         confidence=confidence,
-                        entropy_scores=entropy_scores,
                         margin_scores=margin_scores,
                         candidate_mask=candidate_mask,
-                        total_budget=num_transfer_tokens[:, s],
+                        conf_target_counts=conf_target_counts,
+                        tentative_target_counts=tentative_target_counts,
+                        tentative_candidate_mask=entropy_candidate_mask,
                         step_idx=s,
                         mask_id=mask_id,
                         final_mask=final_mask,
@@ -1043,12 +1251,8 @@ class MDLMSampler(BaseSampler):
                         tentative_stable_run=tentative_stable_run,
                         tentative_last_conf=tentative_last_conf,
                         tentative_last_margin=tentative_last_margin,
-                        enable_entropy_priority=enable_entropy_priority and s < entropy_guided_steps,
                         enable_tentative_commit=enable_tentative_commit,
                         enable_targeted_remask=enable_targeted_remask,
-                        enable_structure_priority=enable_structure_priority,
-                        enable_priority_age_bonus=enable_priority_age_bonus,
-                        tentative_budget_ratio=tentative_budget_ratio,
                         tentative_min_hold_steps=tentative_min_hold_steps,
                         tentative_stable_steps=tentative_stable_steps,
                         tentative_max_hold_steps=tentative_max_hold_steps,
@@ -1056,32 +1260,30 @@ class MDLMSampler(BaseSampler):
                         tentative_final_margin_thresh=tentative_final_margin_thresh,
                         remask_rollback_prob_thresh=remask_rollback_prob_thresh,
                         remask_flip_thresh=remask_flip_thresh,
-                        priority_entropy_weight=priority_entropy_weight,
-                        priority_structure_weight=priority_structure_weight,
-                        priority_age_weight=priority_age_weight,
-                        priority_confidence_weight=priority_confidence_weight,
-                        structure_prior_mode=structure_prior_mode,
-                        structure_prior_strength=structure_prior_strength,
                         diagnostics=diagnostics,
                     )
                 else:
+                    entropy_transfer = entropy_candidate_mask
+                    x[entropy_transfer] = x0[entropy_transfer]
+                    confidence_mask = candidate_mask & ~entropy_transfer
+                    confidence_counts = torch.clamp(
+                        num_transfer_tokens[:, s].to(torch.long) - entropy_trigger_counts,
+                        min=0,
+                    )
                     transfer_index = select_transfer_positions(
                         confidence=confidence,
-                        mask_index=candidate_mask,
-                        target_counts=num_transfer_tokens[:, s],
-                        entropy_scores=entropy_scores if enable_entropy_priority else None,
-                        entropy_first_k=(
-                            entropy_min_tokens_per_step if enable_entropy_priority else 0
-                        ),
+                        mask_index=confidence_mask,
+                        target_counts=confidence_counts,
                     )
                     x[transfer_index] = x0[transfer_index]
                     if enable_sampler_diagnostics:
                         diagnostics["baseline_finalize_count"] += int(
-                            transfer_index.sum().item()
+                            (transfer_index | entropy_transfer).sum().item()
                         )
                         diagnostics["quota_conf_total"] += int(
-                            num_transfer_tokens[:, s].sum().item()
+                            confidence_counts.sum().item()
                         )
+                global_step_idx += 1
                 if histories is not None:
                     histories.append(x.clone())
 

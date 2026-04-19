@@ -3,27 +3,15 @@ import torch.nn.functional as F
 
 from dllm.core.schedulers import BaseAlphaScheduler
 
-_STRUCTURE_SYMBOLS = {
-    "=",
-    "+",
-    "-",
-    "*",
-    "/",
-    "(",
-    ")",
-    "[",
-    "]",
-    "{",
-    "}",
-    ":",
-    ",",
-    ".",
-    ";",
-}
 _LOGICAL_CONNECTORS = {
     "because",
     "therefore",
     "thus",
+    "since",
+    "given",
+    "now",
+    "to",
+    "hence",
     "however",
     "so",
     "then",
@@ -31,25 +19,44 @@ _LOGICAL_CONNECTORS = {
     "next",
     "finally",
 }
-_CODE_KEYWORDS = {"def", "if", "else", "for", "while", "return", "class", "try"}
+_CODE_KEYWORDS = {
+    "def",
+    "if",
+    "else",
+    "elif",
+    "for",
+    "while",
+    "return",
+    "class",
+    "try",
+    "except",
+    "with",
+    "import",
+    "from",
+    "switch",
+    "case",
+    "function",
+    "var",
+    "let",
+    "const",
+}
+_TOKEN_EDGE_PUNCT = ".,;:!?()[]{}\"'"
 
 
 def _normalize_token(token: str) -> str:
     token = str(token)
     for prefix in ("Ġ", "▁", "Ċ", "ĠĠ"):
         token = token.replace(prefix, "")
-    return token.strip().lower()
+    return token.strip().strip(_TOKEN_EDGE_PUNCT).lower()
 
 
 def _token_has_structure(token: str) -> bool:
     normalized = _normalize_token(token)
     if not normalized:
         return False
-    if token in _STRUCTURE_SYMBOLS or normalized in _STRUCTURE_SYMBOLS:
-        return True
     if normalized in _LOGICAL_CONNECTORS or normalized in _CODE_KEYWORDS:
         return True
-    return any(char in _STRUCTURE_SYMBOLS for char in normalized if len(normalized) == 1)
+    return False
 
 
 def get_num_transfer_tokens(
@@ -228,6 +235,111 @@ def build_priority_scores(
         + age_weight * age_scores.to(torch.float32)
         - confidence_weight * confidence.to(torch.float32)
     )
+
+
+def compute_entropy_phase_scale(
+    step_ratio: float,
+    warmup_ratio: float,
+    active_end_ratio: float,
+    end_ratio: float,
+) -> float:
+    """
+    Compute the phase scale for entropy credit accumulation.
+
+    Warmup:    [0, warmup_ratio)          -> 0.0
+    Active:    [warmup_ratio, active_end) -> 1.0
+    Cooldown:  [active_end_ratio, end)    -> 0.5
+    Off:       [end_ratio, 1.0]           -> 0.0
+    """
+    if step_ratio < warmup_ratio:
+        return 0.0
+    if step_ratio < active_end_ratio:
+        return 1.0
+    if step_ratio < end_ratio:
+        return 0.5
+    return 0.0
+
+
+def update_entropy_credit(
+    entropy_credit: torch.Tensor,
+    phase_scale: float,
+    credit_rate: float,
+) -> torch.Tensor:
+    """
+    Accumulate entropy credit for samples currently in the active entropy phase.
+    """
+    if phase_scale <= 0 or credit_rate <= 0:
+        return entropy_credit
+    return entropy_credit + float(phase_scale * credit_rate)
+
+
+def select_entropy_candidate_mask(
+    *,
+    priority_scores: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    structure_scores: torch.Tensor,
+    age_scores: torch.Tensor,
+    confidence: torch.Tensor,
+    top_candidate_pool: int,
+    use_quality_gate: bool,
+    confidence_floor: float,
+    age_threshold: int,
+) -> torch.Tensor:
+    """
+    Select at most one entropy candidate per row from the top priority pool.
+    """
+    if priority_scores.shape != candidate_mask.shape:
+        raise ValueError("priority_scores and candidate_mask must share the same shape")
+
+    selected = torch.zeros_like(candidate_mask, dtype=torch.bool)
+    if top_candidate_pool <= 0:
+        return selected
+
+    neg = torch.finfo(priority_scores.dtype).min
+    for row in range(priority_scores.size(0)):
+        masked_count = int(candidate_mask[row].sum().item())
+        if masked_count == 0:
+            continue
+
+        k = min(top_candidate_pool, masked_count)
+        row_scores = torch.where(
+            candidate_mask[row],
+            priority_scores[row].to(torch.float32),
+            torch.full_like(priority_scores[row], neg, dtype=torch.float32),
+        )
+        top_indices = torch.topk(row_scores, k=k).indices
+
+        if use_quality_gate:
+            qualified = (
+                (structure_scores[row, top_indices] > 0)
+                | (age_scores[row, top_indices] >= age_threshold)
+                | (confidence[row, top_indices] >= confidence_floor)
+            )
+        else:
+            qualified = torch.ones_like(top_indices, dtype=torch.bool)
+
+        if not qualified.any():
+            continue
+
+        chosen_index = top_indices[qualified][0]
+        selected[row, chosen_index] = True
+
+    return selected
+
+
+def compute_entropy_trigger_counts(
+    entropy_credit: torch.Tensor,
+    candidate_exists: torch.Tensor,
+    max_trigger_per_step: int = 1,
+) -> torch.Tensor:
+    """
+    Convert accumulated credit into sparse per-step entropy trigger counts.
+    """
+    if max_trigger_per_step <= 0:
+        return torch.zeros_like(entropy_credit, dtype=torch.long)
+
+    triggerable = (entropy_credit >= 1.0) & candidate_exists.to(torch.bool)
+    return triggerable.to(torch.long).clamp(max=max_trigger_per_step)
 
 
 def update_tentative_stats(

@@ -17,12 +17,16 @@ from dllm.core.samplers.utils import (
     add_gumbel_noise,
     build_priority_scores,
     build_structure_prior_scores,
+    compute_entropy_phase_scale,
+    compute_entropy_trigger_counts,
     compute_tentative_finalize_mask,
     compute_tentative_rollback_mask,
     get_num_transfer_tokens,
     get_top1_margin,
     get_token_entropy,
+    select_entropy_candidate_mask,
     select_transfer_positions,
+    update_entropy_credit,
     update_tentative_stats,
 )
 from dllm.core.schedulers import LinearAlphaScheduler
@@ -65,6 +69,8 @@ def _make_mock_tokenizer(
         8: "(",
         9: ")",
         10: "prompt",
+        11: "Therefore",
+        12: "return",
     }
 
     def convert_ids_to_tokens(ids):
@@ -257,10 +263,18 @@ class TestPriorityHelpers:
 
     def test_structure_prior_detects_structural_tokens(self):
         tokenizer = _make_mock_tokenizer()
-        x = torch.tensor([[3, 7, 4]], dtype=torch.long)
+        x = torch.tensor([[11, 7, 4]], dtype=torch.long)
         mask = torch.tensor([[True, True, True]])
         out = build_structure_prior_scores(tokenizer, x, mask, "token_type", 1.0)
         assert out[0, 0].item() > out[0, 1].item()
+        assert out[0, 2].item() > out[0, 1].item()
+
+    def test_structure_prior_ignores_symbols(self):
+        tokenizer = _make_mock_tokenizer()
+        x = torch.tensor([[3, 7, 12]], dtype=torch.long)
+        mask = torch.tensor([[True, True, True]])
+        out = build_structure_prior_scores(tokenizer, x, mask, "token_type", 1.0)
+        assert out[0, 0].item() == 0.0
         assert out[0, 2].item() > out[0, 1].item()
 
     def test_build_priority_scores_can_disable_components(self):
@@ -329,6 +343,61 @@ class TestPriorityHelpers:
             stable_steps=2,
         )
         assert rollback_mask.tolist() == [[True, True, True]]
+
+    def test_entropy_phase_scale_segments(self):
+        assert compute_entropy_phase_scale(0.01, 0.05, 0.20, 0.30) == 0.0
+        assert compute_entropy_phase_scale(0.10, 0.05, 0.20, 0.30) == 1.0
+        assert compute_entropy_phase_scale(0.25, 0.05, 0.20, 0.30) == 0.5
+        assert compute_entropy_phase_scale(0.40, 0.05, 0.20, 0.30) == 0.0
+
+    def test_update_entropy_credit_accumulates_by_phase_scale(self):
+        credit = torch.tensor([0.0, 0.5], dtype=torch.float32)
+        out = update_entropy_credit(credit, phase_scale=0.5, credit_rate=0.4)
+        assert out.tolist() == pytest.approx([0.2, 0.7], rel=1e-5)
+
+    def test_select_entropy_candidate_mask_applies_quality_gate(self):
+        priority = torch.tensor([[0.9, 0.8, 0.7]], dtype=torch.float32)
+        candidate_mask = torch.tensor([[True, True, True]])
+        structure = torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32)
+        age = torch.tensor([[0.0, 0.0, 3.0]], dtype=torch.float32)
+        confidence = torch.tensor([[0.05, 0.05, 0.05]], dtype=torch.float32)
+        out = select_entropy_candidate_mask(
+            priority_scores=priority,
+            candidate_mask=candidate_mask,
+            structure_scores=structure,
+            age_scores=age,
+            confidence=confidence,
+            top_candidate_pool=2,
+            use_quality_gate=True,
+            confidence_floor=0.15,
+            age_threshold=2,
+        )
+        assert out.tolist() == [[False, True, False]]
+
+    def test_select_entropy_candidate_mask_without_quality_gate_uses_top_priority(self):
+        priority = torch.tensor([[0.9, 0.8, 0.7]], dtype=torch.float32)
+        candidate_mask = torch.tensor([[True, True, True]])
+        zeros = torch.zeros_like(priority)
+        out = select_entropy_candidate_mask(
+            priority_scores=priority,
+            candidate_mask=candidate_mask,
+            structure_scores=zeros,
+            age_scores=zeros,
+            confidence=zeros,
+            top_candidate_pool=3,
+            use_quality_gate=False,
+            confidence_floor=0.15,
+            age_threshold=2,
+        )
+        assert out.tolist() == [[True, False, False]]
+
+    def test_entropy_trigger_counts_require_credit_and_candidate(self):
+        credit = torch.tensor([0.6, 1.1, 1.4], dtype=torch.float32)
+        candidate_exists = torch.tensor([True, False, True])
+        out = compute_entropy_trigger_counts(
+            credit, candidate_exists, max_trigger_per_step=1
+        )
+        assert out.tolist() == [0, 0, 1]
 
 
 class TestSelectTransferPositions:
@@ -428,11 +497,14 @@ class TestMDLMSamplerExtensions:
                 max_new_tokens=2,
                 block_size=2,
                 enable_entropy_priority=True,
-                entropy_min_tokens_per_step=1,
-                entropy_early_ratio=1.0,
+                enable_entropy_credit_scheduler=True,
+                entropy_credit_rate=1.0,
+                entropy_warmup_ratio=0.0,
+                entropy_active_end_ratio=1.0,
+                entropy_end_ratio=1.0,
                 enable_tentative_commit=True,
                 enable_targeted_remask=False,
-                tentative_budget_ratio=1.0,
+                entropy_use_quality_gate=False,
                 enable_sampler_diagnostics=True,
             ),
             return_dict=False,
@@ -440,6 +512,7 @@ class TestMDLMSamplerExtensions:
         diagnostics = sampler._last_sampler_diagnostics
         assert diagnostics["tentative_enter_count"] > 0
         assert diagnostics["tentative_rollback_count"] == 0
+        assert diagnostics["entropy_trigger_count"] > 0
 
     def test_targeted_remask_can_rollback_tentative_tokens(self):
         logits_1 = torch.full((1, 3, 12), -6.0, dtype=torch.float32)
@@ -460,11 +533,14 @@ class TestMDLMSamplerExtensions:
                 max_new_tokens=2,
                 block_size=2,
                 enable_entropy_priority=True,
-                entropy_min_tokens_per_step=1,
-                entropy_early_ratio=1.0,
+                enable_entropy_credit_scheduler=True,
+                entropy_credit_rate=1.0,
+                entropy_warmup_ratio=0.0,
+                entropy_active_end_ratio=1.0,
+                entropy_end_ratio=1.0,
                 enable_tentative_commit=True,
                 enable_targeted_remask=True,
-                tentative_budget_ratio=1.0,
+                entropy_use_quality_gate=False,
                 remask_flip_thresh=1,
                 remask_rollback_prob_thresh=0.95,
                 enable_sampler_diagnostics=True,
@@ -474,3 +550,84 @@ class TestMDLMSamplerExtensions:
         diagnostics = sampler._last_sampler_diagnostics
         assert diagnostics["tentative_enter_count"] > 0
         assert diagnostics["tentative_rollback_count"] > 0
+
+    def test_entropy_only_uses_credit_trigger_instead_of_fixed_every_step(self):
+        logits = torch.full((1, 3, 12), -6.0, dtype=torch.float32)
+        logits[0, 1, 11] = 2.0
+        logits[0, 2, 5] = 2.0
+        sampler = self._make_sampler([logits, logits, logits, logits])
+        sampler.sample(
+            [[10]],
+            MDLMSamplerConfig(
+                steps=4,
+                max_new_tokens=2,
+                block_size=2,
+                enable_entropy_priority=True,
+                enable_entropy_credit_scheduler=True,
+                entropy_credit_rate=0.4,
+                entropy_warmup_ratio=0.0,
+                entropy_active_end_ratio=1.0,
+                entropy_end_ratio=1.0,
+                enable_tentative_commit=False,
+                entropy_use_quality_gate=False,
+                enable_sampler_diagnostics=True,
+            ),
+            return_dict=False,
+        )
+        diagnostics = sampler._last_sampler_diagnostics
+        # 4 steps * 0.4 credit => sparse trigger once instead of every step.
+        assert diagnostics["entropy_trigger_count"] == 1
+
+    def test_structure_priority_can_enable_credit_candidate_selection(self):
+        logits = torch.full((1, 3, 12), -8.0, dtype=torch.float32)
+        logits[0, 1, 5] = 2.5  # non-structural token with higher raw score
+        logits[0, 2, 11] = 2.0  # structural token "Therefore"
+        sampler = self._make_sampler([logits, logits])
+        sampler.sample(
+            [[10]],
+            MDLMSamplerConfig(
+                steps=2,
+                max_new_tokens=2,
+                block_size=2,
+                enable_entropy_priority=True,
+                enable_entropy_credit_scheduler=True,
+                entropy_credit_rate=1.0,
+                entropy_warmup_ratio=0.0,
+                entropy_active_end_ratio=1.0,
+                entropy_end_ratio=1.0,
+                enable_tentative_commit=True,
+                enable_structure_priority=True,
+                structure_prior_mode="token_type",
+                entropy_use_quality_gate=True,
+                entropy_conf_floor=0.99,
+                enable_sampler_diagnostics=True,
+            ),
+            return_dict=False,
+        )
+        diagnostics = sampler._last_sampler_diagnostics
+        assert diagnostics["tentative_enter_count"] > 0
+
+    def test_infill_credit_scheduler_runs_tentative_path(self):
+        logits = torch.full((1, 3, 12), -6.0, dtype=torch.float32)
+        logits[0, 1, 11] = 2.0
+        logits[0, 2, 5] = 2.0
+        sampler = self._make_sampler([logits, logits, logits])
+        sampler.infill(
+            [[10, 2, 2]],
+            MDLMSamplerConfig(
+                steps=3,
+                block_size=3,
+                enable_entropy_priority=True,
+                enable_entropy_credit_scheduler=True,
+                entropy_credit_rate=1.0,
+                entropy_warmup_ratio=0.0,
+                entropy_active_end_ratio=1.0,
+                entropy_end_ratio=1.0,
+                enable_tentative_commit=True,
+                entropy_use_quality_gate=False,
+                enable_sampler_diagnostics=True,
+            ),
+            return_dict=False,
+        )
+        diagnostics = sampler._last_sampler_diagnostics
+        assert diagnostics["tentative_enter_count"] > 0
