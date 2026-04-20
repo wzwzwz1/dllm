@@ -3,25 +3,39 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-GRID_TASK="gsm8k_cot"
-GRID_NUM_FEWSHOT=5
-GRID_LIMIT=200
-GRID_MODEL="llada"
-GRID_MAX_NEW_TOKENS=256
-GRID_STEPS=64
-GRID_BLOCK_SIZE=32
-GRID_CFG_SCALE=0.0
-GRID_BEGIN_SUPPRESS_TOKENS="[126081;126348]"
-GRID_ENTROPY_TOP_K=64
+: "${GRID_TASK:=gsm8k_cot}"
+: "${GRID_NUM_FEWSHOT:=5}"
+: "${GRID_LIMIT:=200}"
+: "${GRID_MODEL:=llada}"
+: "${GRID_MAX_NEW_TOKENS:=256}"
+: "${GRID_STEPS:=64}"
+: "${GRID_BLOCK_SIZE:=32}"
+: "${GRID_CFG_SCALE:=0.0}"
+: "${GRID_BEGIN_SUPPRESS_TOKENS:=[126081;126348]}"
+: "${GRID_ENTROPY_TOP_K:=64}"
+: "${SWEEP_BASE_ROOT:=${REPO_ROOT}/.logs/sweeps}"
+: "${SWEEP_NAME_SUFFIX:=gsm8k-cot-limit200-entropy-grid72}"
+: "${EXPECTED_COMBINATION_COUNT:=72}"
 
-GRID_CREDIT_RATES=(0.20 0.30 0.40)
-GRID_WARMUP_RATIOS=(0.00 0.05)
-GRID_ACTIVE_END_RATIOS=(0.10 0.15 0.20)
-GRID_END_RATIOS=(0.25 0.30 0.35 0.40)
+if ! declare -p GRID_CREDIT_RATES >/dev/null 2>&1; then
+  GRID_CREDIT_RATES=(0.20 0.30 0.40)
+fi
+if ! declare -p GRID_WARMUP_RATIOS >/dev/null 2>&1; then
+  GRID_WARMUP_RATIOS=(0.00 0.05)
+fi
+if ! declare -p GRID_ACTIVE_END_RATIOS >/dev/null 2>&1; then
+  GRID_ACTIVE_END_RATIOS=(0.10 0.15 0.20)
+fi
+if ! declare -p GRID_END_RATIOS >/dev/null 2>&1; then
+  GRID_END_RATIOS=(0.25 0.30 0.35 0.40)
+fi
 
-SWEEP_BASE_ROOT="${REPO_ROOT}/.logs/sweeps"
-SWEEP_REGISTRY_PATH="${SWEEP_BASE_ROOT}/latest-gsm8k-cot-limit200-entropy-grid72.path"
-SWEEP_REGISTRY_LOCK="${SWEEP_BASE_ROOT}/.latest-gsm8k-cot-limit200-entropy-grid72.lock"
+refresh_sweep_paths() {
+  SWEEP_REGISTRY_PATH="${SWEEP_BASE_ROOT}/latest-${SWEEP_NAME_SUFFIX}.path"
+  SWEEP_REGISTRY_LOCK="${SWEEP_BASE_ROOT}/.latest-${SWEEP_NAME_SUFFIX}.lock"
+}
+
+refresh_sweep_paths
 
 ensure_environment() {
   if [[ -f "${HOME}/.zshrc" ]]; then
@@ -82,13 +96,14 @@ build_all_combinations() {
     done
   done
 
-  if [[ "${#GRID_COMBINATIONS[@]}" -ne 72 ]]; then
-    echo "Expected 72 combinations, got ${#GRID_COMBINATIONS[@]}." >&2
+  if [[ "${#GRID_COMBINATIONS[@]}" -ne "${EXPECTED_COMBINATION_COUNT}" ]]; then
+    echo "Expected ${EXPECTED_COMBINATION_COUNT} combinations, got ${#GRID_COMBINATIONS[@]}." >&2
     exit 1
   fi
 }
 
 resolve_sweep_root() {
+  refresh_sweep_paths
   mkdir -p "${SWEEP_BASE_ROOT}"
 
   if [[ -n "${OUTPUT_ROOT:-}" ]]; then
@@ -98,8 +113,10 @@ resolve_sweep_root() {
     return
   fi
 
-  exec 201>"${SWEEP_REGISTRY_LOCK}"
-  flock 201
+  if command -v flock >/dev/null 2>&1; then
+    exec 201>"${SWEEP_REGISTRY_LOCK}"
+    flock 201
+  fi
 
   if [[ -f "${SWEEP_REGISTRY_PATH}" ]]; then
     local existing_root
@@ -111,7 +128,7 @@ resolve_sweep_root() {
         done_count="$(find "${existing_runs_root}" -name done.ok | wc -l | tr -d ' ')"
       fi
 
-      if [[ "${done_count}" -lt 72 ]]; then
+      if [[ "${done_count}" -lt "${EXPECTED_COMBINATION_COUNT}" ]]; then
         SWEEP_ROOT="${existing_root}"
       fi
     fi
@@ -120,7 +137,7 @@ resolve_sweep_root() {
   if [[ -z "${SWEEP_ROOT:-}" ]]; then
     local timestamp
     timestamp="$(date +%Y%m%d-%H%M%S)"
-    SWEEP_ROOT="${SWEEP_BASE_ROOT}/${timestamp}-gsm8k-cot-limit200-entropy-grid72"
+    SWEEP_ROOT="${SWEEP_BASE_ROOT}/${timestamp}-${SWEEP_NAME_SUFFIX}"
     mkdir -p "${SWEEP_ROOT}"
     printf '%s\n' "${SWEEP_ROOT}" > "${SWEEP_REGISTRY_PATH}"
   fi
@@ -142,11 +159,12 @@ initialize_sweep_root() {
   "cfg_scale": ${GRID_CFG_SCALE},
   "begin_suppress_tokens": "${GRID_BEGIN_SUPPRESS_TOKENS}",
   "entropy_top_k": ${GRID_ENTROPY_TOP_K},
+  "expected_combination_count": ${EXPECTED_COMBINATION_COUNT},
   "grid": {
-    "entropy_credit_rate": [0.20, 0.30, 0.40],
-    "entropy_warmup_ratio": [0.00, 0.05],
-    "entropy_active_end_ratio": [0.10, 0.15, 0.20],
-    "entropy_end_ratio": [0.25, 0.30, 0.35, 0.40]
+    "entropy_credit_rate": [$(IFS=,; printf '%s' "${GRID_CREDIT_RATES[*]}")],
+    "entropy_warmup_ratio": [$(IFS=,; printf '%s' "${GRID_WARMUP_RATIOS[*]}")],
+    "entropy_active_end_ratio": [$(IFS=,; printf '%s' "${GRID_ACTIVE_END_RATIOS[*]}")],
+    "entropy_end_ratio": [$(IFS=,; printf '%s' "${GRID_END_RATIOS[*]}")]
   }
 }
 EOF
@@ -215,11 +233,16 @@ write_command_script() {
 
 update_reports() {
   local sweep_root="$1"
-  {
-    flock 202
+  if command -v flock >/dev/null 2>&1; then
+    {
+      flock 202
+      python "${REPO_ROOT}/scripts/update_entropy_grid_reports.py" \
+        --sweep-root "${sweep_root}"
+    } 202>"${sweep_root}/.report.lock"
+  else
     python "${REPO_ROOT}/scripts/update_entropy_grid_reports.py" \
       --sweep-root "${sweep_root}"
-  } 202>"${sweep_root}/.report.lock"
+  fi
 }
 
 run_grid_slice() {

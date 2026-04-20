@@ -682,3 +682,74 @@ for row in rows:
         print(row["run_id"], row["eval_log_path"])
 PY
 ```
+
+## 14. `gpu2` 单卡 48 组 Entropy Grid Search
+
+如果你想单独在 `gpu2` 上跑一轮新的参数搜索，可以使用：
+
+- [run_entropy_grid_gpu2_len256_step128.sh](/Users/wz/code/dllm/scripts/run_entropy_grid_gpu2_len256_step128.sh)
+
+这轮搜索固定使用：
+
+- `tasks=gsm8k_cot`
+- `num_fewshot=5`
+- `limit=100`
+- `max_new_tokens=256`
+- `steps=128`
+- `block_size=32`
+- `entropy_top_k=64`
+- `gpu=2`
+
+网格参数为：
+
+- `entropy_credit_rate`: `0.20, 0.30, 0.40, 0.50`
+- `entropy_warmup_ratio`: `0.00, 0.05`
+- `entropy_active_end_ratio`: `0.10, 0.20`
+- `entropy_end_ratio`: `0.25, 0.30, 0.35`
+
+总共 `48` 组，顺序仍然是：
+
+1. `credit_rate`
+2. `warmup_ratio`
+3. `active_end_ratio`
+4. `end_ratio`
+
+### 14.1 启动方式
+
+```bash
+export MODEL_PATH=/disk/wangzhe/.cache/huggingface/hub/models--GSAI-ML--LLaDA-8B-Instruct/snapshots/08b83a6feb34df1a6011b80c3c00c7563e963b07
+
+bash /disk/wangzhe/dllm/scripts/run_entropy_grid_gpu2_len256_step128.sh
+```
+
+如果你想手动指定 sweep 目录：
+
+```bash
+export OUTPUT_ROOT=/disk/wangzhe/dllm/.logs/sweeps/20260420-entropy-grid48-gpu2
+```
+
+### 14.2 sweep 目录命名
+
+默认目录格式为：
+
+```text
+/disk/wangzhe/dllm/.logs/sweeps/{timestamp}-gsm8k-cot-limit100-len256-step128-entropy-grid48-gpu2/
+```
+
+它和之前的：
+
+- `...limit200-entropy-grid72`
+
+使用不同的 registry 文件，不会互相覆盖，也不会误续跑到旧实验里。
+
+### 14.3 输出与 resume
+
+输出结构和双 GPU 版本保持一致：
+
+- `grid_manifest.csv`
+- `leaderboard.csv`
+- `leaderboard.md`
+- `failures.csv`
+- `runs/rXXX__.../`
+
+`done.ok` 存在时会自动跳过，所以中断后直接重新执行同一脚本即可 resume。
