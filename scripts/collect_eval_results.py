@@ -21,21 +21,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 SUMMARY_RE = re.compile(
-    r"llada \((?P<config>.+?)\), gen_kwargs: \(None\), limit: (?P<limit>[0-9.]+), "
+    r"llada \((?P<config>.+?)\), gen_kwargs: \(.+?\), limit: (?P<limit>[0-9.]+), "
     r"num_fewshot: (?P<num_fewshot>\d+), batch_size: (?P<batch_size>\d+)"
-)
-TASK_ROW_RE = re.compile(
-    r"^\|gsm8k_cot\|\s*(?P<version>\d+)\|(?P<filter>[^|]+)\|\s*(?P<nshot>\d+)\|"
-    r"(?P<metric>[^|]+)\|↑\s*\|(?P<value>[0-9.]+)\|±\s*\|(?P<stderr>[0-9.]+)\|$"
-)
-CONT_ROW_RE = re.compile(
-    r"^\|\s*\|\s*\|(?P<filter>[^|]+)\|\s*(?P<nshot>\d+)\|(?P<metric>[^|]+)\|↑\s*\|"
-    r"(?P<value>[0-9.]+)\|±\s*\|(?P<stderr>[0-9.]+)\|$"
 )
 GENERATING_RE = re.compile(
     r"Generating\.\.\.:\s+100%\|.+\[(?P<duration>[0-9:]+)<00:00,"
 )
+FLOAT_RE = re.compile(r"^-?[0-9]+(?:\.[0-9]+)?$")
 
 
 @dataclass
@@ -54,6 +48,53 @@ class EvalResult:
     duration: str | None
     comparable: bool = True
     note: str = ""
+
+
+def _strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def _parse_markdown_row(line: str) -> list[str] | None:
+    if not line.startswith("|") or not line.endswith("|"):
+        return None
+
+    columns = [part.strip() for part in line.split("|")[1:-1]]
+    if not columns:
+        return None
+
+    # Skip separator rows like |---|---:|---|
+    if all(column and set(column) <= {"-", ":"} for column in columns):
+        return None
+
+    return columns
+
+
+def _extract_metric_row(columns: list[str]) -> tuple[str, float, float] | None:
+    if not columns:
+        return None
+
+    first_column = columns[0].strip()
+    if first_column not in {"gsm8k_cot", ""}:
+        return None
+
+    filter_name = None
+    for column in columns:
+        normalized = column.strip()
+        if normalized in {"flexible-extract", "strict-match"}:
+            filter_name = normalized
+            break
+    if filter_name is None:
+        return None
+
+    numeric_values = [
+        float(column) for column in columns if FLOAT_RE.match(column.strip())
+    ]
+    if len(numeric_values) < 2:
+        return None
+
+    value = numeric_values[-2]
+    stderr = numeric_values[-1]
+    return filter_name, value, stderr
 
 
 def parse_model_args(config_blob: str) -> dict[str, str]:
@@ -110,7 +151,7 @@ def parse_eval_log(path: Path) -> EvalResult:
 
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for raw_line in handle:
-            line = raw_line.strip()
+            line = _strip_ansi(raw_line).strip()
             if not summary_match:
                 summary_match = SUMMARY_RE.search(line)
                 if summary_match:
@@ -126,16 +167,18 @@ def parse_eval_log(path: Path) -> EvalResult:
             if gen_match:
                 duration = gen_match.group("duration")
 
-            row_match = TASK_ROW_RE.match(line)
-            if row_match and row_match.group("filter").strip() == "flexible-extract":
-                flexible_exact_match = float(row_match.group("value"))
-                flexible_stderr = float(row_match.group("stderr"))
+            row = _parse_markdown_row(line)
+            metric_row = _extract_metric_row(row) if row is not None else None
+            if metric_row is None:
                 continue
 
-            cont_match = CONT_ROW_RE.match(line)
-            if cont_match and cont_match.group("filter").strip() == "strict-match":
-                strict_exact_match = float(cont_match.group("value"))
-                strict_stderr = float(cont_match.group("stderr"))
+            filter_name, value, stderr = metric_row
+            if filter_name == "flexible-extract":
+                flexible_exact_match = value
+                flexible_stderr = stderr
+            elif filter_name == "strict-match":
+                strict_exact_match = value
+                strict_stderr = stderr
 
     return EvalResult(
         log_path=str(path),
